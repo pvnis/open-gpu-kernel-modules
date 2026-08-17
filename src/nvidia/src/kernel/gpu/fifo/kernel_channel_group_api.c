@@ -46,6 +46,13 @@
 #include "rmapi/rs_utils.h"
 #include "containers/eheap_old.h"
 
+#include "kernel/os/os.h"
+
+// GHOST EXPERIMENT (0e): deferred re-probe, defined in kernel_ctxshare.c.
+extern void ghostReprobeDeferred_GHOST(OBJGPU *pGpu);
+// GHOST EXPERIMENT (0g): per-process tenant index, defined in kernel_ctxshare.c.
+extern NvU32 ghostTenantIndex_GHOST(void);
+
 NV_STATUS
 kchangrpapiConstruct_IMPL
 (
@@ -1197,7 +1204,12 @@ kchangrpapiCtrlCmdGpFifoSchedule_IMPL
         // Ghost-style time-division is viable here; if it runs at full rate, the
         // detach is overridden, same as userspace. Compile-time toggle.
         {
-            const NvBool bGhostDetach = NV_FALSE; // 0b answered: detach doesn't stick
+            // Runtime knob: insmod nvidia.ko NVreg_RegistryDwords="GhostDetach=1"
+            NvU32  ghostDetachReg = 0;
+            NvBool bGhostDetach;
+            if (osReadRegistryDword(pGpu, "GhostDetach", &ghostDetachReg) != NV_OK)
+                ghostDetachReg = 0;
+            bGhostDetach = (ghostDetachReg != 0);
             if (bGhostDetach && (pSchedParams != NULL) && pSchedParams->bEnable && (status == NV_OK))
             {
                 NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS off;
@@ -1211,6 +1223,90 @@ kchangrpapiCtrlCmdGpFifoSchedule_IMPL
                           "GHOST 0b: force-disabled TSG client 0x%08x obj 0x%08x after enable -> 0x%x\n",
                           hClient, hObject, ds);
             }
+        }
+
+        // === GHOST EXPERIMENT (0g): per-TSG timeslice, originated at kernel
+        // privilege, weighted per tenant. On GB205 a 16:1 timeslice ratio set
+        // from userspace divided the GPU 1:1 (GSP ignored it). This asks the
+        // same question of a datacenter GSP: does the runlist actually honour
+        // per-TSG timeslice? Knobs:
+        //   GhostTimeslice  = microseconds for tenant 0 (0 => do not touch)
+        //   GhostTimesliceB = microseconds for every later tenant
+        {
+            NvU32 tsA = 0, tsB = 0;
+            if (osReadRegistryDword(pGpu, "GhostTimeslice", &tsA) != NV_OK)
+                tsA = 0;
+            if (osReadRegistryDword(pGpu, "GhostTimesliceB", &tsB) != NV_OK)
+                tsB = 0;
+            if ((tsA != 0) && (pSchedParams != NULL) && pSchedParams->bEnable &&
+                (status == NV_OK))
+            {
+                NVA06C_CTRL_TIMESLICE_PARAMS ts;
+                NV_STATUS sSet, sGet;
+                NvU32 tenant = ghostTenantIndex_GHOST();
+                NvU64 want = ((tenant == 0) || (tsB == 0)) ? tsA : tsB;
+
+                portMemSet(&ts, 0, sizeof(ts));
+                ts.timesliceUs = want;
+                sSet = pRmApi->Control(pRmApi, hClient, hObject,
+                                       NVA06C_CTRL_CMD_SET_TIMESLICE,
+                                       &ts, sizeof(ts));
+                portMemSet(&ts, 0, sizeof(ts));
+                sGet = pRmApi->Control(pRmApi, hClient, hObject,
+                                       NVA06C_CTRL_CMD_GET_TIMESLICE,
+                                       &ts, sizeof(ts));
+                NV_PRINTF(LEVEL_ERROR,
+                          "GHOST 0g: tenant %u TSG 0x%08x SET_TIMESLICE(%llu us)=0x%x "
+                          "GET=0x%x readback=%llu us\n",
+                          tenant, hObject, want, sSet, sGet, ts.timesliceUs);
+            }
+        }
+
+        // === GHOST EXPERIMENT (0h): runlist interleave level, the one temporal
+        // lever never tested on GB205 (it was admin-gated from the Sentry, and
+        // we could not set it). At kernel privilege we can. A HIGH TSG is
+        // supposed to appear (M+1)*L times in the runlist against a LOW TSG's
+        // one, so with the tenants' TSG counts equal this should skew service.
+        //   GhostInterleave  = level for tenant 0 (0 LOW, 1 MEDIUM, 2 HIGH;
+        //                      255 => do not touch)
+        //   GhostInterleaveB = level for every later tenant
+        {
+            NvU32 ilA = 0xff, ilB = 0xff;
+            if (osReadRegistryDword(pGpu, "GhostInterleave", &ilA) != NV_OK)
+                ilA = 0xff;
+            if (osReadRegistryDword(pGpu, "GhostInterleaveB", &ilB) != NV_OK)
+                ilB = 0xff;
+            if ((ilA != 0xff) && (pSchedParams != NULL) && pSchedParams->bEnable &&
+                (status == NV_OK))
+            {
+                NVA06C_CTRL_INTERLEAVE_LEVEL_PARAMS il;
+                NV_STATUS sSet, sGet;
+                NvU32 tenant = ghostTenantIndex_GHOST();
+                NvU32 want = ((tenant == 0) || (ilB == 0xff)) ? ilA : ilB;
+
+                portMemSet(&il, 0, sizeof(il));
+                il.tsgInterleaveLevel = want;
+                sSet = pRmApi->Control(pRmApi, hClient, hObject,
+                                       NVA06C_CTRL_CMD_SET_INTERLEAVE_LEVEL,
+                                       &il, sizeof(il));
+                portMemSet(&il, 0, sizeof(il));
+                sGet = pRmApi->Control(pRmApi, hClient, hObject,
+                                       NVA06C_CTRL_CMD_GET_INTERLEAVE_LEVEL,
+                                       &il, sizeof(il));
+                NV_PRINTF(LEVEL_ERROR,
+                          "GHOST 0h: tenant %u TSG 0x%08x SET_INTERLEAVE(%u)=0x%x "
+                          "GET=0x%x readback=%u\n",
+                          tenant, hObject, want, sSet, sGet, il.tsgInterleaveLevel);
+            }
+        }
+
+        // === GHOST EXPERIMENT (0e): re-issue the 0c/0d controls now that the
+        // ctxshares are fully constructed and registered with GSP. Inside their
+        // own constructor they returned OBJECT_NOT_FOUND (0x57), which says
+        // nothing about feature support; this call site is the control.
+        if ((pSchedParams != NULL) && pSchedParams->bEnable && (status == NV_OK))
+        {
+            ghostReprobeDeferred_GHOST(pGpu);
         }
         return status;
     }

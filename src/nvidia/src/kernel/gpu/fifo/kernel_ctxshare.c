@@ -35,11 +35,70 @@
 #include "rmapi/rs_utils.h"
 #include "platform/sli/sli.h"
 #include "containers/eheap_old.h"
+#include "kernel/os/os.h"
 // GHOST EXPERIMENT (Phase 0c): headers to impose a static TPC partition at
 // kernel privilege from within RM.
 #include "rmapi/rmapi.h"
 #include "ctrl/ctrl0080/ctrl0080gr.h"
 #include "ctrl/ctrl9067.h"
+
+// === GHOST EXPERIMENT (0e): deferred re-probe.
+//
+// The 0c/0d probes below run inside kctxshareapiConstruct_IMPL, i.e. inside the
+// ctxshare's OWN constructor. SET_TPC_PARTITION_TABLE and SET/GET_CWD_WATERMARK
+// are RMCTRL_FLAGS_ROUTE_TO_PHYSICAL (0x40), so on a GSP GPU they are RPC'd to
+// physical RM in the GSP -- which cannot resolve a handle for an object whose
+// construction has not finished. That yields NV_ERR_OBJECT_NOT_FOUND (0x57),
+// which is NOT NV_ERR_NOT_SUPPORTED (0x56) and says nothing about whether the
+// die implements the feature.
+//
+// So: record each ctxshare here, and re-issue the same controls later, from the
+// GPFIFO_SCHEDULE path, by which point the object is registered with GSP. The
+// pair of results discriminates "called too early" from "die lacks the feature".
+#define GHOST_MAX_DEFERRED 128
+#define GHOST_TOTAL_TPC     54   // A100: 108 SMs / 2 SMs per TPC
+typedef struct
+{
+    NvHandle hClient;
+    NvHandle hDevice;
+    NvHandle hChanGrp;
+    NvHandle hCtxShare;
+    NvBool   bDone;
+} GHOST_DEFERRED;
+GHOST_DEFERRED g_ghostDeferred[GHOST_MAX_DEFERRED];
+NvU32          g_ghostDeferredCount = 0;
+// How many partitions have been successfully imposed so far. With
+// GhostDisjoint=1 this picks a non-overlapping TPC range per tenant, which is
+// the actual AMD-CU-mask analog: tenant N gets TPCs [N*count, (N+1)*count).
+NvU32          g_ghostSliceIdx = 0;
+// Next free TPC index, so tenants of *unequal* width still get disjoint ranges.
+NvU32          g_ghostNextBase = 0;
+
+//
+// Tenant identity for the experiments: the calling process. A tenant creates
+// several RM clients (torch creates one per subsystem), so keying on hClient
+// counts one tenant many times; the pid is stable for the life of the workload
+// and is what a per-sandbox broker would key on too.
+//
+#define GHOST_MAX_TENANTS 32
+NvU32 g_ghostTenants[GHOST_MAX_TENANTS];
+NvU32 g_ghostTenantCount = 0;
+
+NvU32
+ghostTenantIndex_GHOST(void)
+{
+    NvU32 pid = osGetCurrentProcess();
+    NvU32 i;
+
+    for (i = 0; i < g_ghostTenantCount; i++)
+    {
+        if (g_ghostTenants[i] == pid)
+            return i;
+    }
+    if (g_ghostTenantCount < GHOST_MAX_TENANTS)
+        g_ghostTenants[g_ghostTenantCount++] = pid;
+    return g_ghostTenantCount - 1;
+}
 
 #define SUBCTXID_EHEAP_OWNER NvU32_BUILD('n','v','r','m')
 #define VASPACEID_EHEAP_OWNER NvU32_BUILD('n','v','r','m')
@@ -201,10 +260,14 @@ kctxshareapiConstruct_IMPL
         NV0080_CTRL_GR_TPC_PARTITION_MODE_PARAMS modeParams;
         NV9067_CTRL_TPC_PARTITION_TABLE_PARAMS  *pTbl;
         NV9067_CTRL_CWD_WATERMARK_PARAMS         wm;
-        NV_STATUS sMode, sTbl = NV_ERR_GENERIC, sWm, sWmGet;
+        NV_STATUS sMode, sModeGet, sWm, sWmGet;
+        NV_STATUS sTblGet0 = NV_ERR_GENERIC, sTbl1 = NV_ERR_GENERIC;
+        NV_STATUS sTblN = NV_ERR_GENERIC, sTblGet1 = NV_ERR_GENERIC;
+        NvU32 modeGot = 0xffff, allTpcGot = 0xff;
+        NvU32 nUsed0 = 0xffff, nUsed1 = 0xffff;
         NvU16 i;
 
-        // 0c: STATIC mode (on the device) + the per-subcontext TPC table.
+        // --- 0c1: put the TSG's gr context into STATIC TPC-partition mode.
         portMemSet(&modeParams, 0, sizeof(modeParams));
         modeParams.hChannelGroup  = pParams->hParent; // the TSG (ctxshare's parent)
         modeParams.mode           = NV0080_CTRL_GR_TPC_PARTITION_MODE_STATIC;
@@ -212,9 +275,45 @@ kctxshareapiConstruct_IMPL
         sMode = pRmApi->Control(pRmApi, hClient, hDevice,
                                 NV0080_CTRL_CMD_GR_SET_TPC_PARTITION_MODE,
                                 &modeParams, sizeof(modeParams));
+
+        // --- 0c2: read the mode back. NV_OK on the SET only means the call was
+        // accepted; this says whether STATIC actually stuck.
+        portMemSet(&modeParams, 0, sizeof(modeParams));
+        modeParams.hChannelGroup = pParams->hParent;
+        sModeGet = pRmApi->Control(pRmApi, hClient, hDevice,
+                                   NV0080_CTRL_CMD_GR_GET_TPC_PARTITION_MODE,
+                                   &modeParams, sizeof(modeParams));
+        if (sModeGet == NV_OK)
+        {
+            modeGot   = (NvU32)modeParams.mode;
+            allTpcGot = (NvU32)modeParams.bEnableAllTpcs;
+        }
+
         pTbl = portMemAllocNonPaged(sizeof(*pTbl));
         if (pTbl != NULL)
         {
+            // --- 0c3: can we even READ the partition table?
+            portMemSet(pTbl, 0, sizeof(*pTbl));
+            sTblGet0 = pRmApi->Control(pRmApi, hClient, hCtxShare,
+                                       NV9067_CTRL_CMD_GET_TPC_PARTITION_TABLE,
+                                       pTbl, sizeof(*pTbl));
+            if (sTblGet0 == NV_OK)
+                nUsed0 = pTbl->numUsedTpc;
+
+            // --- 0c4: a MINIMAL table (one TPC). This is the discriminator:
+            // NOT_SUPPORTED here means the control is absent from this die's
+            // firmware; INVALID_ARGUMENT/INVALID_STATE would mean it is present
+            // and merely rejecting our TPC indices (GA100 is floorswept, so the
+            // valid global indices need not be 0..N-1).
+            portMemSet(pTbl, 0, sizeof(*pTbl));
+            pTbl->numUsedTpc = 1;
+            pTbl->tpcList[0].globalTpcIndex = 0;
+            pTbl->tpcList[0].lmemBlockIndex = 0;
+            sTbl1 = pRmApi->Control(pRmApi, hClient, hCtxShare,
+                                    NV9067_CTRL_CMD_SET_TPC_PARTITION_TABLE,
+                                    pTbl, sizeof(*pTbl));
+
+            // --- 0c5: the half-partition we actually want to impose.
             portMemSet(pTbl, 0, sizeof(*pTbl));
             pTbl->numUsedTpc = GHOST_TPC_COUNT;
             for (i = 0; i < GHOST_TPC_COUNT; i++)
@@ -222,14 +321,37 @@ kctxshareapiConstruct_IMPL
                 pTbl->tpcList[i].globalTpcIndex = i;
                 pTbl->tpcList[i].lmemBlockIndex = i;
             }
-            sTbl = pRmApi->Control(pRmApi, hClient, hCtxShare,
-                                   NV9067_CTRL_CMD_SET_TPC_PARTITION_TABLE,
-                                   pTbl, sizeof(*pTbl));
+            sTblN = pRmApi->Control(pRmApi, hClient, hCtxShare,
+                                    NV9067_CTRL_CMD_SET_TPC_PARTITION_TABLE,
+                                    pTbl, sizeof(*pTbl));
+
+            // --- 0c6: read back again, in case a SET silently took effect.
+            portMemSet(pTbl, 0, sizeof(*pTbl));
+            sTblGet1 = pRmApi->Control(pRmApi, hClient, hCtxShare,
+                                       NV9067_CTRL_CMD_GET_TPC_PARTITION_TABLE,
+                                       pTbl, sizeof(*pTbl));
+            if (sTblGet1 == NV_OK)
+                nUsed1 = pTbl->numUsedTpc;
+
             portMemFree(pTbl);
         }
         NV_PRINTF(LEVEL_ERROR,
-                  "GHOST 0c: ctxshare 0x%08x SET_TPC_PARTITION_MODE(STATIC)=0x%x SET_TPC_PARTITION_TABLE(%u tpc)=0x%x\n",
-                  hCtxShare, sMode, (NvU32)GHOST_TPC_COUNT, sTbl);
+                  "GHOST 0c: ctxshare 0x%08x SETMODE(STATIC)=0x%x GETMODE=0x%x(mode=%u allTpc=%u) "
+                  "GETTBL0=0x%x(n=%u) SETTBL(1)=0x%x SETTBL(%u)=0x%x GETTBL1=0x%x(n=%u)\n",
+                  hCtxShare, sMode, sModeGet, modeGot, allTpcGot,
+                  sTblGet0, nUsed0, sTbl1, (NvU32)GHOST_TPC_COUNT, sTblN,
+                  sTblGet1, nUsed1);
+
+        // Record for the deferred (0e) re-probe once GSP knows this object.
+        if (g_ghostDeferredCount < GHOST_MAX_DEFERRED)
+        {
+            GHOST_DEFERRED *pD = &g_ghostDeferred[g_ghostDeferredCount++];
+            pD->hClient   = hClient;
+            pD->hDevice   = hDevice;
+            pD->hChanGrp  = pParams->hParent;
+            pD->hCtxShare = hCtxShare;
+            pD->bDone     = NV_FALSE;
+        }
 
         // 0d: per-subcontext CUDA Work Distributor watermark (min = most throttled).
         portMemSet(&wm, 0, sizeof(wm));
@@ -254,6 +376,143 @@ failed:
     }
 
     return rmStatus;
+}
+
+//
+// GHOST 0e: re-issue the 0c/0d controls for every ctxshare recorded during
+// construction, from a call site where the object is fully registered (the
+// GPFIFO_SCHEDULE path). Called with the GPU lock held, same as the 0b hook.
+//
+void
+ghostReprobeDeferred_GHOST(OBJGPU *pGpu)
+{
+    RM_API *pRmApi = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
+    NvU32   idx;
+    //
+    // Runtime knobs, so one build can sweep the partition size and separate the
+    // two levers. Set via, e.g.:
+    //   insmod nvidia.ko NVreg_RegistryDwords="GhostTpcCount=13;GhostWatermark=0"
+    //   GhostTpcCount  = TPCs granted to the first tenant (0 => leave the table alone)
+    //   GhostTpcCountB = TPCs granted to every later tenant (0 => same as GhostTpcCount).
+    //                    Unequal counts are how a *weight* is expressed spatially.
+    //   GhostDisjoint  = 1 => lay each tenant's range after the previous one's
+    //   GhostWatermark = 1 => also clamp the CWD watermark to MIN
+    //
+    NvU32 ghostTpcCount = 27;
+    NvU32 ghostTpcCountB = 0;
+    NvU32 ghostWatermark = 0;
+    NvU32 ghostDisjoint = 0;
+
+    if (osReadRegistryDword(pGpu, "GhostTpcCount", &ghostTpcCount) != NV_OK)
+        ghostTpcCount = 27;
+    if (osReadRegistryDword(pGpu, "GhostTpcCountB", &ghostTpcCountB) != NV_OK)
+        ghostTpcCountB = 0;
+    if (osReadRegistryDword(pGpu, "GhostWatermark", &ghostWatermark) != NV_OK)
+        ghostWatermark = 0;
+    if (osReadRegistryDword(pGpu, "GhostDisjoint", &ghostDisjoint) != NV_OK)
+        ghostDisjoint = 0;
+    if (ghostTpcCount > NV9067_CTRL_TPC_PARTITION_TABLE_TPC_COUNT_MAX)
+        ghostTpcCount = NV9067_CTRL_TPC_PARTITION_TABLE_TPC_COUNT_MAX;
+    if (ghostTpcCountB > NV9067_CTRL_TPC_PARTITION_TABLE_TPC_COUNT_MAX)
+        ghostTpcCountB = NV9067_CTRL_TPC_PARTITION_TABLE_TPC_COUNT_MAX;
+
+    for (idx = 0; idx < g_ghostDeferredCount; idx++)
+    {
+        GHOST_DEFERRED *pD = &g_ghostDeferred[idx];
+        NV0080_CTRL_GR_TPC_PARTITION_MODE_PARAMS modeParams;
+        NV9067_CTRL_TPC_PARTITION_TABLE_PARAMS  *pTbl;
+        NV9067_CTRL_CWD_WATERMARK_PARAMS         wm;
+        NV_STATUS sMode, sModeGet, sWm, sWmGet;
+        NV_STATUS sTblN = NV_ERR_GENERIC;
+        NvU32 modeGot = 0xffff, allTpcGot = 0xff;
+        NvU16 i;
+
+        if (pD->bDone)
+            continue;
+        pD->bDone = NV_TRUE;
+
+        portMemSet(&modeParams, 0, sizeof(modeParams));
+        modeParams.hChannelGroup  = pD->hChanGrp;
+        modeParams.mode           = NV0080_CTRL_GR_TPC_PARTITION_MODE_STATIC;
+        modeParams.bEnableAllTpcs = NV_FALSE;
+        sMode = pRmApi->Control(pRmApi, pD->hClient, pD->hDevice,
+                                NV0080_CTRL_CMD_GR_SET_TPC_PARTITION_MODE,
+                                &modeParams, sizeof(modeParams));
+
+        portMemSet(&modeParams, 0, sizeof(modeParams));
+        modeParams.hChannelGroup = pD->hChanGrp;
+        sModeGet = pRmApi->Control(pRmApi, pD->hClient, pD->hDevice,
+                                   NV0080_CTRL_CMD_GR_GET_TPC_PARTITION_MODE,
+                                   &modeParams, sizeof(modeParams));
+        if (sModeGet == NV_OK)
+        {
+            modeGot   = (NvU32)modeParams.mode;
+            allTpcGot = (NvU32)modeParams.bEnableAllTpcs;
+        }
+
+        if (ghostTpcCount > 0)
+        {
+            pTbl = portMemAllocNonPaged(sizeof(*pTbl));
+            if (pTbl != NULL)
+            {
+                NvU32 base = 0;
+                NvU32 count = ((g_ghostSliceIdx > 0) && (ghostTpcCountB > 0))
+                              ? ghostTpcCountB : ghostTpcCount;
+
+                if (ghostDisjoint != 0)
+                {
+                    if (g_ghostNextBase + count > GHOST_TOTAL_TPC)
+                        g_ghostNextBase = 0;
+                    base = g_ghostNextBase;
+                }
+
+                portMemSet(pTbl, 0, sizeof(*pTbl));
+                pTbl->numUsedTpc = (NvU16)count;
+                for (i = 0; i < (NvU16)count; i++)
+                {
+                    pTbl->tpcList[i].globalTpcIndex = (NvU16)(base + i);
+                    pTbl->tpcList[i].lmemBlockIndex = i;
+                }
+                sTblN = pRmApi->Control(pRmApi, pD->hClient, pD->hCtxShare,
+                                        NV9067_CTRL_CMD_SET_TPC_PARTITION_TABLE,
+                                        pTbl, sizeof(*pTbl));
+                portMemFree(pTbl);
+
+                if (sTblN == NV_OK)
+                {
+                    NV_PRINTF(LEVEL_ERROR,
+                              "GHOST 0f: ctxshare 0x%08x granted %u TPCs %u..%u (slice %u)\n",
+                              pD->hCtxShare, count, base, base + count - 1,
+                              g_ghostSliceIdx);
+                    g_ghostSliceIdx++;
+                    if (ghostDisjoint != 0)
+                        g_ghostNextBase = base + count;
+                }
+            }
+        }
+
+        if (ghostWatermark != 0)
+        {
+            portMemSet(&wm, 0, sizeof(wm));
+            wm.watermarkValue = NV9067_CTRL_CWD_WATERMARK_VALUE_MIN;
+            sWm = pRmApi->Control(pRmApi, pD->hClient, pD->hCtxShare,
+                                  NV9067_CTRL_CMD_SET_CWD_WATERMARK, &wm, sizeof(wm));
+            portMemSet(&wm, 0, sizeof(wm));
+            sWmGet = pRmApi->Control(pRmApi, pD->hClient, pD->hCtxShare,
+                                     NV9067_CTRL_CMD_GET_CWD_WATERMARK, &wm, sizeof(wm));
+        }
+        else
+        {
+            sWm = sWmGet = NV_ERR_GENERIC; // not attempted
+            portMemSet(&wm, 0, sizeof(wm));
+        }
+
+        NV_PRINTF(LEVEL_ERROR,
+                  "GHOST 0e: ctxshare 0x%08x SETMODE=0x%x GETMODE=0x%x(mode=%u allTpc=%u) "
+                  "SETTBL(%u)=0x%x SETWM=0x%x GETWM=0x%x wm=%u\n",
+                  pD->hCtxShare, sMode, sModeGet, modeGot, allTpcGot,
+                  ghostTpcCount, sTblN, sWm, sWmGet, wm.watermarkValue);
+    }
 }
 
 void
