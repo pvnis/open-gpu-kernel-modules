@@ -195,7 +195,7 @@ kctxshareapiConstruct_IMPL
     // real version keys it on a per-sandbox weight and picks disjoint ranges.
     if (rmStatus == NV_OK)
     {
-        enum { GHOST_TPC_COUNT = 12 };  // half of the RTX 5070's 24 TPCs; adjust per GPU
+        enum { GHOST_TPC_COUNT = 27 };  // half of the A100's 54 TPCs (108 SMs); adjust per GPU
         RM_API   *pRmApi    = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
         NvHandle  hCtxShare = RES_GET_HANDLE(pKernelCtxShareApi);
         NV0080_CTRL_GR_TPC_PARTITION_MODE_PARAMS modeParams;
