@@ -1188,6 +1188,30 @@ kchangrpapiCtrlCmdGpFifoSchedule_IMPL
                           pRmCtrlParams->pParams,
                           pRmCtrlParams->paramsSize,
                           status);
+
+        // === GHOST EXPERIMENT (Phase 0b): after the sandbox enables its channel
+        // group, force it back OFF from inside RM, to test whether a driver-level
+        // TSG detach STICKS against a doorbell workload on Blackwell's GSP -- the
+        // userspace GPFIFO_SCHEDULE(disable) did not. If the burn pod then makes
+        // no progress (no matmuls, GPU idle), a driver detach sticks and
+        // Ghost-style time-division is viable here; if it runs at full rate, the
+        // detach is overridden, same as userspace. Compile-time toggle.
+        {
+            const NvBool bGhostDetach = NV_FALSE; // 0b answered: detach doesn't stick
+            if (bGhostDetach && (pSchedParams != NULL) && pSchedParams->bEnable && (status == NV_OK))
+            {
+                NVA06C_CTRL_GPFIFO_SCHEDULE_PARAMS off;
+                NV_STATUS ds;
+                portMemSet(&off, 0, sizeof(off));
+                off.bEnable = NV_FALSE;
+                ds = pRmApi->Control(pRmApi, hClient, hObject,
+                                     NVA06C_CTRL_CMD_INTERNAL_GPFIFO_SCHEDULE,
+                                     &off, sizeof(off));
+                NV_PRINTF(LEVEL_ERROR,
+                          "GHOST 0b: force-disabled TSG client 0x%08x obj 0x%08x after enable -> 0x%x\n",
+                          hClient, hObject, ds);
+            }
+        }
         return status;
     }
 

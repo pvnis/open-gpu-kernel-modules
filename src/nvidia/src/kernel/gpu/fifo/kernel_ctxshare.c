@@ -35,6 +35,11 @@
 #include "rmapi/rs_utils.h"
 #include "platform/sli/sli.h"
 #include "containers/eheap_old.h"
+// GHOST EXPERIMENT (Phase 0c): headers to impose a static TPC partition at
+// kernel privilege from within RM.
+#include "rmapi/rmapi.h"
+#include "ctrl/ctrl0080/ctrl0080gr.h"
+#include "ctrl/ctrl9067.h"
 
 #define SUBCTXID_EHEAP_OWNER NvU32_BUILD('n','v','r','m')
 #define VASPACEID_EHEAP_OWNER NvU32_BUILD('n','v','r','m')
@@ -166,6 +171,77 @@ kctxshareapiConstruct_IMPL
             goto failed;
 
         refAddDependant(pKernelGraphicsContextRef, pCallContext->pResourceRef);
+    }
+
+    // === GHOST EXPERIMENT: on every CUDA context-share (subcontext), try to
+    // impose a spatial compute partition at KERNEL privilege -- which userspace
+    // (the gVisor Sentry, or a root+CAP_SYS_ADMIN helper) cannot: those get
+    // NV_ERR_INSUFFICIENT_PERMISSIONS (0x1b); from inside RM the privilege check
+    // passes, so any error we see now is real feature support, not privilege.
+    //
+    // Two driver-reachable ctxshare levers, both logged. Read `sudo dmesg | grep
+    // GHOST` after running a CUDA workload:
+    //   0c  SET_TPC_PARTITION_TABLE  -- assign specific TPCs (AMD-CU-mask analog)
+    //   0d  SET_CWD_WATERMARK        -- per-subcontext CUDA Work Distributor throttle
+    //
+    // Interpretation (per NVIDIA-COMPUTE-ISOLATION.md):
+    //   = 0x0 (NV_OK) AND throughput drops to the fraction -> IMPOSED PARTITION WORKS (build the broker)
+    //   = 0x57 (NV_ERR_NOT_SUPPORTED)  -> die/firmware doesn't implement it (RTX 5070 / GB205 result)
+    //   = 0x1b (INSUFFICIENT_PERMISSIONS) -> not at kernel priv; origination path is wrong
+    //
+    // MEASURED on consumer Blackwell (RTX 5070, GB205): both 0x57. UNKNOWN and
+    // worth testing on datacenter/pro dies (RTX A6000 GA102, RTX 6000 Pro
+    // Blackwell GB202, A100/H100). GHOST_TPC_COUNT is hardcoded for the test; a
+    // real version keys it on a per-sandbox weight and picks disjoint ranges.
+    if (rmStatus == NV_OK)
+    {
+        enum { GHOST_TPC_COUNT = 12 };  // half of the RTX 5070's 24 TPCs; adjust per GPU
+        RM_API   *pRmApi    = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
+        NvHandle  hCtxShare = RES_GET_HANDLE(pKernelCtxShareApi);
+        NV0080_CTRL_GR_TPC_PARTITION_MODE_PARAMS modeParams;
+        NV9067_CTRL_TPC_PARTITION_TABLE_PARAMS  *pTbl;
+        NV9067_CTRL_CWD_WATERMARK_PARAMS         wm;
+        NV_STATUS sMode, sTbl = NV_ERR_GENERIC, sWm, sWmGet;
+        NvU16 i;
+
+        // 0c: STATIC mode (on the device) + the per-subcontext TPC table.
+        portMemSet(&modeParams, 0, sizeof(modeParams));
+        modeParams.hChannelGroup  = pParams->hParent; // the TSG (ctxshare's parent)
+        modeParams.mode           = NV0080_CTRL_GR_TPC_PARTITION_MODE_STATIC;
+        modeParams.bEnableAllTpcs = NV_FALSE;
+        sMode = pRmApi->Control(pRmApi, hClient, hDevice,
+                                NV0080_CTRL_CMD_GR_SET_TPC_PARTITION_MODE,
+                                &modeParams, sizeof(modeParams));
+        pTbl = portMemAllocNonPaged(sizeof(*pTbl));
+        if (pTbl != NULL)
+        {
+            portMemSet(pTbl, 0, sizeof(*pTbl));
+            pTbl->numUsedTpc = GHOST_TPC_COUNT;
+            for (i = 0; i < GHOST_TPC_COUNT; i++)
+            {
+                pTbl->tpcList[i].globalTpcIndex = i;
+                pTbl->tpcList[i].lmemBlockIndex = i;
+            }
+            sTbl = pRmApi->Control(pRmApi, hClient, hCtxShare,
+                                   NV9067_CTRL_CMD_SET_TPC_PARTITION_TABLE,
+                                   pTbl, sizeof(*pTbl));
+            portMemFree(pTbl);
+        }
+        NV_PRINTF(LEVEL_ERROR,
+                  "GHOST 0c: ctxshare 0x%08x SET_TPC_PARTITION_MODE(STATIC)=0x%x SET_TPC_PARTITION_TABLE(%u tpc)=0x%x\n",
+                  hCtxShare, sMode, (NvU32)GHOST_TPC_COUNT, sTbl);
+
+        // 0d: per-subcontext CUDA Work Distributor watermark (min = most throttled).
+        portMemSet(&wm, 0, sizeof(wm));
+        wm.watermarkValue = NV9067_CTRL_CWD_WATERMARK_VALUE_MIN;
+        sWm = pRmApi->Control(pRmApi, hClient, hCtxShare,
+                              NV9067_CTRL_CMD_SET_CWD_WATERMARK, &wm, sizeof(wm));
+        portMemSet(&wm, 0, sizeof(wm));
+        sWmGet = pRmApi->Control(pRmApi, hClient, hCtxShare,
+                                 NV9067_CTRL_CMD_GET_CWD_WATERMARK, &wm, sizeof(wm));
+        NV_PRINTF(LEVEL_ERROR,
+                  "GHOST 0d: ctxshare 0x%08x SET_CWD_WATERMARK(1)=0x%x GET=0x%x readback=%u\n",
+                  hCtxShare, sWm, sWmGet, wm.watermarkValue);
     }
 
 failed:
