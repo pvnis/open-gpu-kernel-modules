@@ -529,12 +529,12 @@ static nv_proc_ops_t nv_procfs_registry_fops = {
     .NV_PROC_OPS_RELEASE = nv_procfs_close_registry,
 };
 
-extern void ghostSchedQueue_GHOST(NvU32 pid, NvU32 attach);
+extern void ghostSchedQueue_GHOST(NvU32 pid, NvU32 action, NvU32 arg);
 
 static int
 nv_procfs_show_gpusched(struct seq_file *m, void *v)
 {
-    seq_printf(m, "write: \"detach <pid>\" or \"attach <pid>\"\n");
+    seq_printf(m, "write: detach <pid> | attach <pid> | ts <pid> <us>\n");
     return 0;
 }
 
@@ -546,7 +546,7 @@ nv_procfs_write_gpusched(
     loff_t *pos
 )
 {
-    char kbuf[64];
+    char kbuf[96];
     NvU32 pid = 0;
     int attach = -1;
     size_t n;
@@ -559,31 +559,23 @@ nv_procfs_write_gpusched(
         return -EFAULT;
     kbuf[count] = '\0';
 
-    if (strncmp(kbuf, "detach", 6) == 0)
-    {
-        attach = 0;
-        n = 6;
-    }
-    else if (strncmp(kbuf, "attach", 6) == 0)
-    {
-        attach = 1;
-        n = 6;
-    }
-    else
-    {
-        return -EINVAL;
-    }
-    while (kbuf[n] == ' ' || kbuf[n] == '\t')
-        n++;
-    while (kbuf[n] >= '0' && kbuf[n] <= '9')
-    {
-        pid = pid * 10 + (NvU32)(kbuf[n] - '0');
-        n++;
-    }
+    NvU32 action;
+    NvU32 arg = 0;
+    if (strncmp(kbuf, "detach", 6) == 0)      { action = 1; n = 6; }
+    else if (strncmp(kbuf, "attach", 6) == 0) { action = 0; n = 6; }
+    else if (strncmp(kbuf, "ts", 2) == 0)     { action = 2; n = 2; }
+    else return -EINVAL;
+    (void)attach;
+    while (kbuf[n] == ' ' || kbuf[n] == '\t') n++;
+    while (kbuf[n] >= '0' && kbuf[n] <= '9') { pid = pid * 10 + (NvU32)(kbuf[n] - '0'); n++; }
     if (pid == 0)
         return -EINVAL;
-
-    ghostSchedQueue_GHOST(pid, (NvU32)attach);
+    if (action == 2) /* ts <pid> <us> */
+    {
+        while (kbuf[n] == ' ' || kbuf[n] == '\t') n++;
+        while (kbuf[n] >= '0' && kbuf[n] <= '9') { arg = arg * 10 + (NvU32)(kbuf[n] - '0'); n++; }
+    }
+    ghostSchedQueue_GHOST(pid, action, arg);
     return count;
 }
 

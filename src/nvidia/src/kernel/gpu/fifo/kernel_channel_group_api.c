@@ -45,6 +45,7 @@
 #include "vgpu/rpc.h"
 #include "rmapi/rs_utils.h"
 #include "ctrl/ctrl2080/ctrl2080fifo.h" // GHOST 0i: FIFO_DISABLE_CHANNELS (detach+preempt)
+#include "ctrl/ctrla06f/ctrla06fgpfifo.h" // GHOST: RESTART_RUNLIST (force preempt)
 #include "containers/eheap_old.h"
 
 #include "kernel/os/os.h"
@@ -71,6 +72,7 @@ typedef struct
 {
     NvU32     pid;        // owning process (the KVM Sentry, one per sandbox)
     NvHandle  hClient;
+    NvHandle  hGroup;     // the channel-group (TSG) API handle, for SET_TIMESLICE
     NvHandle  hChannels[NV2080_CTRL_FIFO_DISABLE_CHANNELS_MAX_ENTRIES];
     NvU32     nCh;
     NvBool    valid;
@@ -84,7 +86,7 @@ static OBJGPU     *g_ghostGpu = NULL;
 // GPFIFO_SCHEDULE hook while the group is being enabled.
 void
 ghostSchedRecord_GHOST(OBJGPU *pGpu, NvU32 pid, NvHandle hClient,
-                       KernelChannelGroup *pKcg)
+                       NvHandle hGroup, KernelChannelGroup *pKcg)
 {
     NvU32 i, slot;
     CHANNEL_NODE *pNode;
@@ -98,7 +100,8 @@ ghostSchedRecord_GHOST(OBJGPU *pGpu, NvU32 pid, NvHandle hClient,
     for (i = 0; i < g_ghostGroupCount; i++)
     {
         if (g_ghostGroups[i].valid && g_ghostGroups[i].pid == pid &&
-            g_ghostGroups[i].hClient == hClient)
+            g_ghostGroups[i].hClient == hClient &&
+            g_ghostGroups[i].hGroup == hGroup)
         {
             slot = i;
             break;
@@ -110,6 +113,7 @@ ghostSchedRecord_GHOST(OBJGPU *pGpu, NvU32 pid, NvHandle hClient,
     portMemSet(&g_ghostGroups[slot], 0, sizeof(g_ghostGroups[slot]));
     g_ghostGroups[slot].pid     = pid;
     g_ghostGroups[slot].hClient = hClient;
+    g_ghostGroups[slot].hGroup  = hGroup;
     for (pNode = pKcg->pChanList->pHead;
          pNode && (g_ghostGroups[slot].nCh < NV2080_CTRL_FIFO_DISABLE_CHANNELS_MAX_ENTRIES);
          pNode = pNode->pNext)
@@ -125,74 +129,99 @@ ghostSchedRecord_GHOST(OBJGPU *pGpu, NvU32 pid, NvHandle hClient,
 }
 
 // Parameters carried to the work item.
-typedef struct { NvU32 pid; NvU32 attach; } GHOST_SCHED_WI;
+typedef struct { NvU32 pid; NvU32 action; NvU32 arg; } GHOST_SCHED_WI;
+// action: 0=attach, 1=detach(+RESTART_RUNLIST), 2=set-timeslice arg=us (+RESTART)
 
-// ghostSchedWorkItem: runs in an RM worker thread with API + all-GPU locks held
-// (see the flags at the queue site), so it may issue a GSP-RPC control. For
-// every recorded channel group of the target pid, disable+preempt (detach) or
-// re-enable (attach) its channels.
+// ghostRestartRunlist: force GSP to expire the current timeslice and restart the
+// runlist the channel belongs to -- a manual, privileged preemption. This is the
+// companion action the earlier detach/timeslice hooks were missing: they changed
+// per-object state without forcing GSP to re-evaluate. Issued on the channel
+// object (A06F) via the owning client from a kernel-priv work item.
+static void
+ghostRestartRunlist(OBJGPU *pGpu, NvHandle hClient, NvHandle hChannel)
+{
+    NVA06F_CTRL_RESTART_RUNLIST_PARAMS rr;
+    NV_STATUS st = NV_OK;
+    portMemSet(&rr, 0, sizeof(rr));
+    rr.bForceRestart = NV_TRUE;
+    rr.bBypassWait   = NV_FALSE;
+    NV_RM_RPC_CONTROL(pGpu, hClient, hChannel,
+                      NVA06F_CTRL_CMD_RESTART_RUNLIST, &rr, sizeof(rr), st);
+    NV_PRINTF(LEVEL_ERROR,
+              "GHOST sched: RESTART_RUNLIST chan 0x%08x -> 0x%x\n", hChannel, st);
+}
+
 static void
 ghostSchedWorkItem(NvU32 gpuInstance, void *pParams)
 {
     GHOST_SCHED_WI *pWi = (GHOST_SCHED_WI *)pParams;
     OBJGPU *pGpu = g_ghostGpu;
-    NvU32 i;
+    NvU32 i, c;
 
     if (pGpu == NULL || pWi == NULL)
         goto done;
 
     for (i = 0; i < g_ghostGroupCount; i++)
     {
-        NV2080_CTRL_FIFO_DISABLE_CHANNELS_PARAMS *pDis;
         NV_STATUS st = NV_OK;
-        NvU32 c;
 
         if (!g_ghostGroups[i].valid || g_ghostGroups[i].pid != pWi->pid ||
             g_ghostGroups[i].nCh == 0)
             continue;
 
-        pDis = portMemAllocNonPaged(sizeof(*pDis));
-        if (pDis == NULL)
+        if (pWi->action == 2)
+        {
+            // SET_TIMESLICE on the TSG, then RESTART_RUNLIST to force GSP to
+            // re-read the runlist and preempt now.
+            NVA06C_CTRL_TIMESLICE_PARAMS ts;
+            portMemSet(&ts, 0, sizeof(ts));
+            ts.timesliceUs = pWi->arg;
+            NV_RM_RPC_CONTROL(pGpu, g_ghostGroups[i].hClient,
+                              g_ghostGroups[i].hGroup,
+                              NVA06C_CTRL_CMD_SET_TIMESLICE, &ts, sizeof(ts), st);
+            NV_PRINTF(LEVEL_ERROR,
+                      "GHOST sched: pid %u SET_TIMESLICE grp 0x%08x = %u us -> 0x%x\n",
+                      pWi->pid, g_ghostGroups[i].hGroup, pWi->arg, st);
+            for (c = 0; c < g_ghostGroups[i].nCh; c++)
+                ghostRestartRunlist(pGpu, g_ghostGroups[i].hClient,
+                                    g_ghostGroups[i].hChannels[c]);
             continue;
-        portMemSet(pDis, 0, sizeof(*pDis));
-        pDis->bDisable = pWi->attach ? NV_FALSE : NV_TRUE;
-        pDis->bOnlyDisableScheduling = NV_FALSE; // detach forces a preempt
-        pDis->bRewindGpPut = NV_FALSE;
-        pDis->pRunlistPreemptEvent = NULL;
-        pDis->numChannels = g_ghostGroups[i].nCh;
-        for (c = 0; c < g_ghostGroups[i].nCh; c++)
-        {
-            pDis->hClientList[c]  = g_ghostGroups[i].hClient;
-            pDis->hChannelList[c] = g_ghostGroups[i].hChannels[c];
         }
-        NV_RM_RPC_CONTROL(pGpu, pGpu->hInternalClient, pGpu->hInternalSubdevice,
-                          NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS,
-                          pDis, sizeof(*pDis), st);
-        NV_PRINTF(LEVEL_ERROR,
-                  "GHOST sched: pid %u %s %u channels -> 0x%x\n",
-                  pWi->pid, pWi->attach ? "ATTACH" : "DETACH",
-                  g_ghostGroups[i].nCh, st);
-        portMemFree(pDis);
 
-        // On detach, also force a preemptive removal of each channel -- a
-        // stronger evict than DISABLE_CHANNELS' preempt, in case a saturating
-        // doorbell workload keeps re-arming the channel.
-        if (!pWi->attach)
+        // attach / detach via DISABLE_CHANNELS
         {
+            NV2080_CTRL_FIFO_DISABLE_CHANNELS_PARAMS *pDis =
+                portMemAllocNonPaged(sizeof(*pDis));
+            if (pDis == NULL)
+                continue;
+            portMemSet(pDis, 0, sizeof(*pDis));
+            pDis->bDisable = (pWi->action == 0) ? NV_FALSE : NV_TRUE;
+            pDis->bOnlyDisableScheduling = NV_FALSE;
+            pDis->bRewindGpPut = NV_FALSE;
+            pDis->pRunlistPreemptEvent = NULL;
+            pDis->numChannels = g_ghostGroups[i].nCh;
             for (c = 0; c < g_ghostGroups[i].nCh; c++)
             {
-                NV2080_CTRL_FIFO_CHANNEL_PREEMPTIVE_REMOVAL_PARAMS pr;
-                NV_STATUS pst = NV_OK;
-                portMemSet(&pr, 0, sizeof(pr));
-                pr.hChannel = g_ghostGroups[i].hChannels[c];
-                NV_RM_RPC_CONTROL(pGpu, pGpu->hInternalClient,
-                                  pGpu->hInternalSubdevice,
-                                  NV2080_CTRL_CMD_FIFO_CHANNEL_PREEMPTIVE_REMOVAL,
-                                  &pr, sizeof(pr), pst);
-                NV_PRINTF(LEVEL_ERROR,
-                          "GHOST sched: pid %u PREEMPTIVE_REMOVAL chan 0x%08x -> 0x%x\n",
-                          pWi->pid, g_ghostGroups[i].hChannels[c], pst);
+                pDis->hClientList[c]  = g_ghostGroups[i].hClient;
+                pDis->hChannelList[c] = g_ghostGroups[i].hChannels[c];
             }
+            NV_RM_RPC_CONTROL(pGpu, pGpu->hInternalClient, pGpu->hInternalSubdevice,
+                              NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS,
+                              pDis, sizeof(*pDis), st);
+            NV_PRINTF(LEVEL_ERROR,
+                      "GHOST sched: pid %u %s %u channels -> 0x%x\n",
+                      pWi->pid, (pWi->action == 0) ? "ATTACH" : "DETACH",
+                      g_ghostGroups[i].nCh, st);
+            portMemFree(pDis);
+        }
+
+        // On detach, force a runlist restart so the disable takes effect on
+        // already-running work instead of only at the next natural idle.
+        if (pWi->action == 1)
+        {
+            for (c = 0; c < g_ghostGroups[i].nCh; c++)
+                ghostRestartRunlist(pGpu, g_ghostGroups[i].hClient,
+                                    g_ghostGroups[i].hChannels[c]);
         }
     }
 
@@ -200,10 +229,8 @@ done:
     portMemFree(pParams);
 }
 
-// ghostSchedQueue_GHOST: called from the procfs write handler (any context).
-// Queues the detach/attach to run under locks. Non-blocking.
 void
-ghostSchedQueue_GHOST(NvU32 pid, NvU32 attach)
+ghostSchedQueue_GHOST(NvU32 pid, NvU32 action, NvU32 arg)
 {
     GHOST_SCHED_WI *pWi;
     OsQueueWorkItemFlags flags;
@@ -214,7 +241,8 @@ ghostSchedQueue_GHOST(NvU32 pid, NvU32 attach)
     if (pWi == NULL)
         return;
     pWi->pid = pid;
-    pWi->attach = attach;
+    pWi->action = action;
+    pWi->arg = arg;
 
     portMemSet(&flags, 0, sizeof(flags));
     flags.bRequiresGpu = NV_TRUE;
@@ -1478,7 +1506,7 @@ kchangrpapiCtrlCmdGpFifoSchedule_IMPL
         // /proc/driver/nvidia/gpusched) can find them. The detach itself is no
         // longer done here unconditionally; it is issued on command. The
         // GhostPreempt knob is kept below as a static self-test only.
-        ghostSchedRecord_GHOST(pGpu, osGetCurrentProcess(), hClient,
+        ghostSchedRecord_GHOST(pGpu, osGetCurrentProcess(), hClient, hObject,
                                pKernelChannelGroupApi->pKernelChannelGroup);
         {
             NvU32 ghostPreempt = 0;
@@ -1488,7 +1516,7 @@ kchangrpapiCtrlCmdGpFifoSchedule_IMPL
                 pSchedParams->bEnable && (status == NV_OK) &&
                 (ghostTenantIndex_GHOST() >= 1))
             {
-                ghostSchedQueue_GHOST(osGetCurrentProcess(), 0);
+                ghostSchedQueue_GHOST(osGetCurrentProcess(), 1, 0); // 1=detach
             }
         }
 
