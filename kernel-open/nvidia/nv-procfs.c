@@ -530,11 +530,17 @@ static nv_proc_ops_t nv_procfs_registry_fops = {
 };
 
 extern void ghostSchedQueue_GHOST(NvU32 pid, NvU32 action, NvU32 arg);
+extern int ghostSchedFormatActive_GHOST(char *buf, int cap);
 
 static int
 nv_procfs_show_gpusched(struct seq_file *m, void *v)
 {
-    seq_printf(m, "write: detach <pid> | attach <pid> | ts <pid> <us>\n");
+    // Report the cached per-tenant activity from the last "poll". A reader
+    // (the GPU scheduler) writes "poll" to refresh it, then reads this.
+    char buf[2048];
+    int n = ghostSchedFormatActive_GHOST(buf, sizeof(buf) - 1);
+    buf[n < 0 ? 0 : (n < (int)sizeof(buf) ? n : (int)sizeof(buf) - 1)] = '\0';
+    seq_printf(m, "%s", buf);
     return 0;
 }
 
@@ -561,6 +567,11 @@ nv_procfs_write_gpusched(
 
     NvU32 action;
     NvU32 arg = 0;
+    if (strncmp(kbuf, "poll", 4) == 0)
+    {
+        ghostSchedQueue_GHOST(0, 3, 0); // sweep all tenants, refresh activity
+        return count;
+    }
     if (strncmp(kbuf, "detach", 6) == 0)      { action = 1; n = 6; }
     else if (strncmp(kbuf, "attach", 6) == 0) { action = 0; n = 6; }
     else if (strncmp(kbuf, "ts", 2) == 0)     { action = 2; n = 2; }

@@ -46,6 +46,8 @@
 #include "rmapi/rs_utils.h"
 #include "ctrl/ctrl2080/ctrl2080fifo.h" // GHOST 0i: FIFO_DISABLE_CHANNELS (detach+preempt)
 #include "ctrl/ctrla06f/ctrla06fgpfifo.h" // GHOST: RESTART_RUNLIST (force preempt)
+#include "kernel/rmapi/rmapi.h"        // GHOST: g_resServ (client lookup)
+#include "kernel/gpu/fifo/kernel_channel.h" // GHOST: CliGetKernelChannel, USERD
 #include "containers/eheap_old.h"
 
 #include "kernel/os/os.h"
@@ -76,7 +78,23 @@ typedef struct
     NvHandle  hChannels[NV2080_CTRL_FIFO_DISABLE_CHANNELS_MAX_ENTRIES];
     NvU32     nCh;
     NvBool    valid;
+    // Activity signal: the last GP_PUT seen on each channel, and whether any
+    // advanced on the most recent poll. This is the trusted, doorbell-aware
+    // "is this sandbox submitting work" signal -- read from the channel's USERD
+    // in the driver, so a tenant cannot lie about it the way it could about an
+    // in-container kernel counter, and it sees doorbell submission that fault
+    // counts and nvidia-smi miss or mis-time.
+    NvU32     lastGpPut[NV2080_CTRL_FIFO_DISABLE_CHANNELS_MAX_ENTRIES];
+    NvBool    active;
 } GHOST_GROUP;
+
+// NV_RAMUSERD_GP_GET / GP_PUT live at words 34/35 of the channel's USERD
+// (GA100/Maxwell layout), i.e. byte offsets 136 and 140. A channel has pending,
+// unconsumed work exactly when PUT != GET -- that is the "wants to run" signal.
+// (PUT-advanced-since-last-poll is wrong: a time-sliced tenant waiting its turn
+// has already pushed its work, so PUT is static though GET has not caught up.)
+#define GHOST_USERD_GP_GET_OFFSET 136
+#define GHOST_USERD_GP_PUT_OFFSET 140
 static GHOST_GROUP g_ghostGroups[GHOST_MAX_GROUPS];
 static NvU32       g_ghostGroupCount = 0;
 static OBJGPU     *g_ghostGpu = NULL;
@@ -165,9 +183,53 @@ ghostSchedWorkItem(NvU32 gpuInstance, void *pParams)
     {
         NV_STATUS st = NV_OK;
 
-        if (!g_ghostGroups[i].valid || g_ghostGroups[i].pid != pWi->pid ||
-            g_ghostGroups[i].nCh == 0)
+        if (!g_ghostGroups[i].valid || g_ghostGroups[i].nCh == 0)
             continue;
+        if (pWi->action != 3 && g_ghostGroups[i].pid != pWi->pid)
+            continue;
+
+        if (pWi->action == 3)
+        {
+            // Poll GP_PUT on each of the tenant's channels and flag the group
+            // active if any advanced since the last poll. Runs under the RM
+            // locks the work item holds, so the handle lookups are safe against
+            // a channel being freed concurrently.
+            MemoryManager *pMM = GPU_GET_MEMORY_MANAGER(pGpu);
+            RsClient *pClient = NULL;
+            NvBool anyAdvanced = NV_FALSE;
+            if (serverGetClientUnderLock(&g_resServ, g_ghostGroups[i].hClient,
+                                         &pClient) == NV_OK && pClient != NULL)
+            {
+                for (c = 0; c < g_ghostGroups[i].nCh; c++)
+                {
+                    KernelChannel *pKC = NULL;
+                    MEMORY_DESCRIPTOR *pUserd;
+                    NvU8 *pMap;
+                    NvU32 gpput;
+                    if (CliGetKernelChannel(pClient, g_ghostGroups[i].hChannels[c],
+                                            &pKC) != NV_OK || pKC == NULL)
+                        continue;
+                    pUserd = pKC->pUserdSubDeviceMemDesc[0];
+                    if (pUserd == NULL)
+                        continue;
+                    NvU32 gpget;
+                    pMap = memmgrMemDescBeginTransfer(pMM, pUserd,
+                                                      TRANSFER_FLAGS_SHADOW_ALLOC);
+                    if (pMap == NULL)
+                        continue;
+                    gpget = *(volatile NvU32 *)(pMap + GHOST_USERD_GP_GET_OFFSET);
+                    gpput = *(volatile NvU32 *)(pMap + GHOST_USERD_GP_PUT_OFFSET);
+                    memmgrMemDescEndTransfer(pMM, pUserd, TRANSFER_FLAGS_SHADOW_ALLOC);
+                    // Pending work (PUT != GET) OR fresh submission since the
+                    // last poll (PUT advanced) both mean the tenant wants the GPU.
+                    if (gpput != gpget || gpput != g_ghostGroups[i].lastGpPut[c])
+                        anyAdvanced = NV_TRUE;
+                    g_ghostGroups[i].lastGpPut[c] = gpput;
+                }
+            }
+            g_ghostGroups[i].active = anyAdvanced;
+            continue;
+        }
 
         if (pWi->action == 2)
         {
@@ -229,11 +291,22 @@ done:
     portMemFree(pParams);
 }
 
+int ghostSchedFormatActive_GHOST(char *buf, int cap); // defined below
+
 void
 ghostSchedQueue_GHOST(NvU32 pid, NvU32 action, NvU32 arg)
 {
     GHOST_SCHED_WI *pWi;
     OsQueueWorkItemFlags flags;
+    // Reference the OS-layer-only formatter so the RM-core --gc-sections link
+    // does not garbage-collect it (nothing else inside RM core calls it). The
+    // guard is never true; the compiler cannot prove that across the parameter,
+    // so the call -- and thus the symbol reference -- survives.
+    if (action == 0xDEADBEEF)
+    {
+        char tmp[1];
+        (void)ghostSchedFormatActive_GHOST(tmp, 0);
+    }
 
     if (g_ghostGpu == NULL)
         return;
@@ -251,6 +324,42 @@ ghostSchedQueue_GHOST(NvU32 pid, NvU32 action, NvU32 arg)
     flags.bDontFreeParams = NV_TRUE; // the callback frees pParams itself
     if (osQueueWorkItem(g_ghostGpu, ghostSchedWorkItem, pWi, flags) != NV_OK)
         portMemFree(pWi);
+}
+
+// ghostSchedFormatActive_GHOST: write "pid <p> active <0|1>" for each distinct
+// tenant into buf (from the cached poll result), returning the length. Called
+// from the procfs read handler; reads only cached flags, no locks.
+int
+ghostSchedFormatActive_GHOST(char *buf, int cap)
+{
+    NvU32 i, j;
+    int n = 0;
+    NvU32 seen[GHOST_MAX_GROUPS];
+    NvU32 nSeen = 0;
+
+    for (i = 0; i < g_ghostGroupCount && nSeen < GHOST_MAX_GROUPS; i++)
+    {
+        NvBool dup = NV_FALSE;
+        NvBool act;
+        if (!g_ghostGroups[i].valid)
+            continue;
+        for (j = 0; j < nSeen; j++)
+            if (seen[j] == g_ghostGroups[i].pid) { dup = NV_TRUE; break; }
+        if (dup)
+            continue;
+        seen[nSeen++] = g_ghostGroups[i].pid;
+        // active if any group of this pid is active
+        act = NV_FALSE;
+        for (j = 0; j < g_ghostGroupCount; j++)
+            if (g_ghostGroups[j].valid &&
+                g_ghostGroups[j].pid == g_ghostGroups[i].pid &&
+                g_ghostGroups[j].active)
+            { act = NV_TRUE; break; }
+        if (n < cap)
+            n += nvDbgSnprintf(buf + n, cap - n, "pid %u active %d\n",
+                               g_ghostGroups[i].pid, act ? 1 : 0);
+    }
+    return n;
 }
 
 
