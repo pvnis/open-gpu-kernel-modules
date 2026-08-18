@@ -529,6 +529,79 @@ static nv_proc_ops_t nv_procfs_registry_fops = {
     .NV_PROC_OPS_RELEASE = nv_procfs_close_registry,
 };
 
+extern void ghostSchedQueue_GHOST(NvU32 pid, NvU32 attach);
+
+static int
+nv_procfs_show_gpusched(struct seq_file *m, void *v)
+{
+    seq_printf(m, "write: \"detach <pid>\" or \"attach <pid>\"\n");
+    return 0;
+}
+
+static ssize_t
+nv_procfs_write_gpusched(
+    struct file *file,
+    const char __user *buf,
+    size_t count,
+    loff_t *pos
+)
+{
+    char kbuf[64];
+    NvU32 pid = 0;
+    int attach = -1;
+    size_t n;
+
+    if (!NV_IS_SUSER())
+        return -EPERM;
+    if (count == 0 || count >= sizeof(kbuf))
+        return -EINVAL;
+    if (copy_from_user(kbuf, buf, count))
+        return -EFAULT;
+    kbuf[count] = '\0';
+
+    if (strncmp(kbuf, "detach", 6) == 0)
+    {
+        attach = 0;
+        n = 6;
+    }
+    else if (strncmp(kbuf, "attach", 6) == 0)
+    {
+        attach = 1;
+        n = 6;
+    }
+    else
+    {
+        return -EINVAL;
+    }
+    while (kbuf[n] == ' ' || kbuf[n] == '\t')
+        n++;
+    while (kbuf[n] >= '0' && kbuf[n] <= '9')
+    {
+        pid = pid * 10 + (NvU32)(kbuf[n] - '0');
+        n++;
+    }
+    if (pid == 0)
+        return -EINVAL;
+
+    ghostSchedQueue_GHOST(pid, (NvU32)attach);
+    return count;
+}
+
+static int
+nv_procfs_open_gpusched(struct inode *inode, struct file *file)
+{
+    return single_open(file, nv_procfs_show_gpusched, NULL);
+}
+
+static nv_proc_ops_t nv_procfs_gpusched_fops = {
+     NV_PROC_OPS_SET_OWNER()
+    .NV_PROC_OPS_OPEN    = nv_procfs_open_gpusched,
+    .NV_PROC_OPS_READ    = seq_read,
+    .NV_PROC_OPS_WRITE   = nv_procfs_write_gpusched,
+    .NV_PROC_OPS_LSEEK   = seq_lseek,
+    .NV_PROC_OPS_RELEASE = single_release
+};
+
 #if defined(CONFIG_PM)
 static int
 nv_procfs_show_suspend_depth(
@@ -1335,6 +1408,10 @@ int nv_procfs_init(void)
         goto failed;
 
     entry = NV_CREATE_PROC_FILE("params", proc_nvidia, params, NULL);
+    if (!entry)
+        goto failed;
+
+    entry = NV_CREATE_PROC_FILE("gpusched", proc_nvidia, gpusched, NULL);
     if (!entry)
         goto failed;
 
