@@ -44,6 +44,7 @@
 #include "gpu/mem_mgr/vaspace_api.h"
 #include "vgpu/rpc.h"
 #include "rmapi/rs_utils.h"
+#include "ctrl/ctrl2080/ctrl2080fifo.h" // GHOST 0i: FIFO_DISABLE_CHANNELS (detach+preempt)
 #include "containers/eheap_old.h"
 
 #include "kernel/os/os.h"
@@ -1297,6 +1298,69 @@ kchangrpapiCtrlCmdGpFifoSchedule_IMPL
                           "GHOST 0h: tenant %u TSG 0x%08x SET_INTERLEAVE(%u)=0x%x "
                           "GET=0x%x readback=%u\n",
                           tenant, hObject, want, sSet, sGet, il.tsgInterleaveLevel);
+            }
+        }
+
+        // === GHOST EXPERIMENT (0i): the REAL runlist detach + preempt, as the
+        // Ghost paper actually does it. 0b above issued GPFIFO_SCHEDULE(disable),
+        // which only removes the TSG from *future* scheduling and takes effect
+        // when the channel idles -- a saturating doorbell workload never idles,
+        // so 0b was inert. FifoDisableChannels with bOnlyDisableScheduling=FALSE
+        // forces a preempt: it evicts the running kernels immediately. This is
+        // Ghost's DetachTSG. Knob: GhostPreempt=1 disables+preempts the channels
+        // of every tenant with index >= 1, leaving tenant 0 with the whole GPU.
+        // If tenant 1+ stalls (no matmuls) while tenant 0 runs full, the runlist
+        // detach STICKS and the temporal lever is real -- our earlier "inert"
+        // was a wrong-primitive artifact.
+        {
+            NvU32 ghostPreempt = 0;
+            if (osReadRegistryDword(pGpu, "GhostPreempt", &ghostPreempt) != NV_OK)
+                ghostPreempt = 0;
+            if ((ghostPreempt != 0) && (pSchedParams != NULL) &&
+                pSchedParams->bEnable && (status == NV_OK) &&
+                (ghostTenantIndex_GHOST() >= 1))
+            {
+                KernelChannelGroup *pKcg =
+                    pKernelChannelGroupApi->pKernelChannelGroup;
+                NV2080_CTRL_FIFO_DISABLE_CHANNELS_PARAMS *pDis =
+                    portMemAllocNonPaged(sizeof(*pDis));
+                if ((pDis != NULL) && (pKcg != NULL) && (pKcg->pChanList != NULL))
+                {
+                    CHANNEL_NODE *pNode;
+                    NvU32 n = 0;
+                    NV_STATUS dp = NV_OK;
+                    portMemSet(pDis, 0, sizeof(*pDis));
+                    pDis->bDisable = NV_TRUE;
+                    pDis->bOnlyDisableScheduling = NV_FALSE; // force preempt
+                    pDis->bRewindGpPut = NV_FALSE;
+                    pDis->pRunlistPreemptEvent = NULL;       // synchronous
+                    for (pNode = pKcg->pChanList->pHead;
+                         pNode && (n < NV2080_CTRL_FIFO_DISABLE_CHANNELS_MAX_ENTRIES);
+                         pNode = pNode->pNext)
+                    {
+                        KernelChannel *pKc = pNode->pKernelChannel;
+                        if (pKc == NULL)
+                            continue;
+                        pDis->hClientList[n]  = RES_GET_CLIENT_HANDLE(pKc);
+                        pDis->hChannelList[n] = RES_GET_HANDLE(pKc);
+                        n++;
+                    }
+                    pDis->numChannels = n;
+                    if (n > 0)
+                    {
+                        NV_RM_RPC_CONTROL(pGpu,
+                                          pGpu->hInternalClient,
+                                          pGpu->hInternalSubdevice,
+                                          NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS,
+                                          pDis, sizeof(*pDis), dp);
+                        NV_PRINTF(LEVEL_ERROR,
+                                  "GHOST 0i: tenant %u DISABLE+PREEMPT %u channels "
+                                  "(bOnlyDisableScheduling=0) -> 0x%x\n",
+                                  ghostTenantIndex_GHOST(), n, dp);
+                    }
+                }
+                if (pDis != NULL)
+                    portMemFree(pDis);
             }
         }
 
