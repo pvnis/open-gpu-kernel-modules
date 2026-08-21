@@ -183,6 +183,20 @@ typedef struct
     uvm_parent_gpu_t *routing_table[UVM_PARENT_ID_MAX_GPUS];
 } uvm_egm_numa_node_info_t;
 
+// gVisor GPU memory overcommit: a tenant group shares one device-resident total
+// and cap across all the va_spaces of one sandbox (see gmem_group below). Opaque
+// here; defined in uvm_va_space.c.
+typedef struct gmem_group_struct gmem_group_t;
+
+// Adjust the device-resident byte count of a va_space's tenant (its group if it
+// has one, else the va_space itself). Lock-free (atomics); callable from the
+// eviction path.
+void uvm_gmem_add_resident(uvm_va_space_t *va_space, NvS64 delta);
+
+// Return true if the va_space's tenant is over its device-resident cap ("gmem").
+// Lock-free; callable from the eviction path.
+bool uvm_gmem_over_budget(uvm_va_space_t *va_space);
+
 struct uvm_va_space_struct
 {
     // Mask of gpus registered with the va space
@@ -199,8 +213,17 @@ struct uvm_va_space_struct
     // evicted for an oversubscribing neighbour. Both are atomic so the eviction
     // path can read them without holding the va_space lock. Set via
     // UVM_SET_GMEM_LIMIT.
+    //
+    // These are used only when the va_space is not in a tenant group. Under
+    // gVisor each process opens its own UVM fd, so one sandbox (tenant) has many
+    // va_spaces; accounting per va_space would let a tenant multiply its
+    // protected residency by forking (the memory analog of the compute packing
+    // attack). gmem_group, when set, points to a shared per-tenant object whose
+    // resident total and cap are used instead, so all of a sandbox's va_spaces
+    // are accounted together. Set once, at UVM_SET_GMEM_LIMIT.
     atomic64_t gmem_resident_bytes;
     atomic64_t gmem_limit_bytes;
+    gmem_group_t *gmem_group;
 
     // Semaphore protecting the state of the va space
     uvm_rw_semaphore_t lock;

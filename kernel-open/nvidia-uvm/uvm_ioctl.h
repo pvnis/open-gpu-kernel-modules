@@ -969,7 +969,8 @@ typedef struct
 typedef struct
 {
     NvU64           limit          NV_ALIGN_BYTES(8); // IN  (bytes; 0 = uncapped)
-    NvU64           residentBytes  NV_ALIGN_BYTES(8); // OUT (current device-resident bytes)
+    NvU64           group          NV_ALIGN_BYTES(8); // IN  (tenant group id; va_spaces sharing an id share one resident total and cap; 0 = this va_space alone)
+    NvU64           residentBytes  NV_ALIGN_BYTES(8); // OUT (the group's current device-resident bytes)
     NV_STATUS       rmStatus;                         // OUT
 } UVM_SET_GMEM_LIMIT_PARAMS;
 

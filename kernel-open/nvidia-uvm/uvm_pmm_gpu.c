@@ -677,7 +677,7 @@ static void gmem_account_chunk(uvm_gpu_chunk_t *chunk, NvS64 delta)
 
     va_space = uvm_va_block_get_va_space_maybe_dead(chunk->va_block);
     if (va_space)
-        atomic64_add(delta, &va_space->gmem_resident_bytes);
+        uvm_gmem_add_resident(va_space, delta);
 }
 
 void uvm_pmm_gpu_unpin_allocated(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, uvm_va_block_t *va_block)
@@ -1524,17 +1524,12 @@ static uvm_gpu_chunk_t *get_over_budget_allocated_chunk(uvm_pmm_gpu_t *pmm)
 
         list_for_each_entry(chunk, &pmm->root_chunks.alloc_list[alloc_list], list) {
             uvm_va_space_t *va_space;
-            NvS64 limit;
 
             if (!chunk->va_block)
                 continue;
 
             va_space = uvm_va_block_get_va_space_maybe_dead(chunk->va_block);
-            if (!va_space)
-                continue;
-
-            limit = atomic64_read(&va_space->gmem_limit_bytes);
-            if (limit > 0 && atomic64_read(&va_space->gmem_resident_bytes) > limit)
+            if (va_space && uvm_gmem_over_budget(va_space))
                 return chunk;
         }
     }

@@ -2143,16 +2143,100 @@ error:
     return status;
 }
 
-// gVisor GPU memory overcommit: set this va_space's device-resident cap ("gmem")
-// and report its current device-resident bytes. The cap is consulted by the
-// per-tenant eviction path (uvm_pmm_gpu.c); a limit of 0 removes it. No va_space
-// lock is needed: both fields are atomic and independent of the va_range tree.
+// gVisor GPU memory overcommit: a tenant group ties together all the va_spaces
+// of one sandbox (each of its processes opens its own UVM fd) so their device
+// residency is capped and accounted as one, defeating the packing attack where a
+// tenant forks processes to multiply its per-va_space protection. Groups are
+// looked up by a Sentry-assigned id and, for simplicity, are never freed: one
+// small struct per unique sandbox over the machine's uptime, a bounded leak.
+// (Refcounted teardown is a straightforward follow-up.)
+struct gmem_group_struct
+{
+    struct list_head list;
+    NvU64 id;
+    atomic64_t resident;
+    atomic64_t limit;
+};
+
+static LIST_HEAD(g_gmem_groups);
+// Plain leaf mutex, outside UVM's lock-ordering framework: held only briefly to
+// look up or create a group in the registry, never nested under a UVM lock.
+static DEFINE_MUTEX(g_gmem_groups_lock);
+
+static gmem_group_t *gmem_group_lookup(NvU64 id)
+{
+    gmem_group_t *group;
+
+    mutex_lock(&g_gmem_groups_lock);
+
+    list_for_each_entry(group, &g_gmem_groups, list) {
+        if (group->id == id)
+            goto out;
+    }
+
+    group = uvm_kvmalloc_zero(sizeof(*group));
+    if (group) {
+        group->id = id;
+        atomic64_set(&group->resident, 0);
+        atomic64_set(&group->limit, 0);
+        list_add(&group->list, &g_gmem_groups);
+    }
+
+out:
+    mutex_unlock(&g_gmem_groups_lock);
+    return group;
+}
+
+void uvm_gmem_add_resident(uvm_va_space_t *va_space, NvS64 delta)
+{
+    gmem_group_t *group = va_space->gmem_group;
+
+    if (group)
+        atomic64_add(delta, &group->resident);
+    else
+        atomic64_add(delta, &va_space->gmem_resident_bytes);
+}
+
+bool uvm_gmem_over_budget(uvm_va_space_t *va_space)
+{
+    gmem_group_t *group = va_space->gmem_group;
+    NvS64 limit, resident;
+
+    if (group) {
+        limit = atomic64_read(&group->limit);
+        resident = atomic64_read(&group->resident);
+    }
+    else {
+        limit = atomic64_read(&va_space->gmem_limit_bytes);
+        resident = atomic64_read(&va_space->gmem_resident_bytes);
+    }
+
+    return limit > 0 && resident > limit;
+}
+
+// gVisor GPU memory overcommit: set the device-resident cap ("gmem") for this
+// va_space's tenant and report the tenant's current device-resident bytes. When
+// params->group is non-zero the va_space joins that tenant group, so all the
+// va_spaces of one sandbox share a resident total and cap; zero keeps the
+// va_space standalone. The cap is consulted by the per-tenant eviction path
+// (uvm_pmm_gpu.c); a limit of 0 removes it.
 NV_STATUS uvm_api_set_gmem_limit(UVM_SET_GMEM_LIMIT_PARAMS *params, struct file *filp)
 {
     uvm_va_space_t *va_space = uvm_va_space_get(filp);
 
-    atomic64_set(&va_space->gmem_limit_bytes, (long long)params->limit);
-    params->residentBytes = (NvU64)atomic64_read(&va_space->gmem_resident_bytes);
+    if (params->group != 0) {
+        gmem_group_t *group = gmem_group_lookup(params->group);
+        if (!group)
+            return NV_ERR_NO_MEMORY;
+        va_space->gmem_group = group;
+        atomic64_set(&group->limit, (long long)params->limit);
+        params->residentBytes = (NvU64)atomic64_read(&group->resident);
+    }
+    else {
+        atomic64_set(&va_space->gmem_limit_bytes, (long long)params->limit);
+        params->residentBytes = (NvU64)atomic64_read(&va_space->gmem_resident_bytes);
+    }
+
     return NV_OK;
 }
 
