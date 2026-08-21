@@ -382,6 +382,14 @@ typedef struct uvm_pmm_gpu_struct
     bool initialized;
 
     bool pma_address_cache_initialized;
+
+    // gVisor GPU memory overcommit: a background thread that proactively drains
+    // tenant groups over their device-resident cap ("gmem") down to it,
+    // independent of PMA pressure, so an oversubscribing tenant is held at its
+    // cap and the card keeps free space for tenants within their share. Reactive
+    // eviction (only when PMA is full) cannot pin a continuously-faulting
+    // oversubscriber; this can. NULL if the thread failed to start.
+    struct task_struct *gmem_evictor;
 } uvm_pmm_gpu_t;
 
 // Return containing GPU

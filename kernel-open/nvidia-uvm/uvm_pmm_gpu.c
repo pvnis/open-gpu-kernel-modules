@@ -176,6 +176,9 @@
 #include "uvm_test.h"
 #include "uvm_linux.h"
 
+#include <linux/kthread.h>
+#include <linux/delay.h>
+
 static int uvm_global_oversubscription = 1;
 module_param(uvm_global_oversubscription, int, S_IRUGO);
 MODULE_PARM_DESC(uvm_global_oversubscription, "Enable (1) or disable (0) global oversubscription support.");
@@ -3038,6 +3041,65 @@ static void process_lazy_free_entry(void *args)
     UVM_ENTRY_VOID(uvm_pmm_gpu_process_lazy_free(args));
 }
 
+// gVisor GPU memory overcommit: evict up to max_evict root chunks belonging to
+// tenant groups that are over their device-resident cap, freeing the memory back
+// to PMA. Only chunks of over-budget groups are picked (via
+// get_over_budget_allocated_chunk / uvm_gmem_over_budget), so tenants within
+// their share are never touched. Returns the number of chunks evicted. Mirrors
+// pick_and_evict_root_chunk's locking (pmm->lock held; the pick takes list_lock).
+static NvU32 gmem_drain_over_budget(uvm_pmm_gpu_t *pmm, NvU32 max_evict)
+{
+    NvU32 evicted = 0;
+
+    uvm_mutex_lock(&pmm->lock);
+
+    while (evicted < max_evict) {
+        uvm_gpu_chunk_t *chunk;
+        uvm_gpu_root_chunk_t *root_chunk;
+        NV_STATUS status;
+
+        uvm_spin_lock(&pmm->list_lock);
+        chunk = get_over_budget_allocated_chunk(pmm);
+        if (chunk)
+            chunk_start_eviction(pmm, chunk);
+        uvm_spin_unlock(&pmm->list_lock);
+
+        if (!chunk)
+            break;
+
+        root_chunk = root_chunk_from_chunk(pmm, chunk);
+        status = evict_root_chunk(pmm, root_chunk, PMM_CONTEXT_DEFAULT);
+        if (status != NV_OK)
+            break;
+
+        // Return the drained device memory to PMA so it is free for tenants
+        // within their share.
+        free_root_chunk(pmm, root_chunk, FREE_ROOT_CHUNK_MODE_DEFAULT);
+        evicted++;
+    }
+
+    uvm_mutex_unlock(&pmm->lock);
+    return evicted;
+}
+
+// gVisor GPU memory overcommit: the background evictor thread. Wakes at a fixed
+// interval and drains any over-budget tenant group down to its cap. When nothing
+// is over budget the drain is a cheap no-op, so the thread is idle-cheap.
+#define GMEM_EVICTOR_INTERVAL_MS 4
+#define GMEM_EVICTOR_MAX_PER_WAKE 16u
+
+static int gmem_evictor_thread(void *arg)
+{
+    uvm_pmm_gpu_t *pmm = (uvm_pmm_gpu_t *)arg;
+
+    while (!kthread_should_stop()) {
+        gmem_drain_over_budget(pmm, GMEM_EVICTOR_MAX_PER_WAKE);
+        msleep_interruptible(GMEM_EVICTOR_INTERVAL_MS);
+    }
+
+    return 0;
+}
+
 NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
 {
     uvm_gpu_t *gpu = uvm_pmm_to_gpu(pmm);
@@ -3147,6 +3209,15 @@ NV_STATUS uvm_pmm_gpu_init(uvm_pmm_gpu_t *pmm)
         }
     }
 
+    // gVisor GPU memory overcommit: start the proactive per-tenant evictor. A
+    // failure to start is non-fatal -- eviction falls back to the reactive
+    // PMA-driven path -- so it must not fail PMM init.
+    pmm->gmem_evictor = kthread_run(gmem_evictor_thread, pmm, "uvm_gmem_evict");
+    if (IS_ERR(pmm->gmem_evictor)) {
+        UVM_ERR_PRINT("failed to start uvm_gmem_evict thread: %ld\n", PTR_ERR(pmm->gmem_evictor));
+        pmm->gmem_evictor = NULL;
+    }
+
     return NV_OK;
 cleanup:
     uvm_pmm_gpu_deinit(pmm);
@@ -3179,6 +3250,13 @@ void uvm_pmm_gpu_deinit(uvm_pmm_gpu_t *pmm)
 
     if (!pmm->initialized)
         return;
+
+    // gVisor GPU memory overcommit: stop the proactive evictor before tearing
+    // down the PMM it operates on.
+    if (pmm->gmem_evictor) {
+        kthread_stop(pmm->gmem_evictor);
+        pmm->gmem_evictor = NULL;
+    }
 
     gpu = uvm_pmm_to_gpu(pmm);
 
