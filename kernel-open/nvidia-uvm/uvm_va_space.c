@@ -265,6 +265,10 @@ NV_STATUS uvm_va_space_create(struct address_space *mapping, uvm_va_space_t **va
     uvm_range_tree_init(&va_space->va_range_tree);
     uvm_init_rwsem(&va_space->ats.lock, UVM_LOCK_ORDER_LEAF);
 
+    // gVisor GPU memory overcommit: start uncapped with zero resident bytes.
+    atomic64_set(&va_space->gmem_resident_bytes, 0);
+    atomic64_set(&va_space->gmem_limit_bytes, 0);
+
     bitmap_zero(va_space->enabled_peers, UVM_MAX_UNIQUE_GPU_PAIRS);
 
     // CPU is not explicitly registered in the va space
@@ -2137,6 +2141,19 @@ NV_STATUS uvm_api_disable_peer_access(UVM_DISABLE_PEER_ACCESS_PARAMS *params, st
 error:
     uvm_va_space_up_write(va_space);
     return status;
+}
+
+// gVisor GPU memory overcommit: set this va_space's device-resident cap ("gmem")
+// and report its current device-resident bytes. The cap is consulted by the
+// per-tenant eviction path (uvm_pmm_gpu.c); a limit of 0 removes it. No va_space
+// lock is needed: both fields are atomic and independent of the va_range tree.
+NV_STATUS uvm_api_set_gmem_limit(UVM_SET_GMEM_LIMIT_PARAMS *params, struct file *filp)
+{
+    uvm_va_space_t *va_space = uvm_va_space_get(filp);
+
+    atomic64_set(&va_space->gmem_limit_bytes, (long long)params->limit);
+    params->residentBytes = (NvU64)atomic64_read(&va_space->gmem_resident_bytes);
+    return NV_OK;
 }
 
 NV_STATUS uvm_test_flush_deferred_work(UVM_TEST_FLUSH_DEFERRED_WORK_PARAMS *params, struct file *filp)

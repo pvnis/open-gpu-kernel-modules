@@ -956,6 +956,24 @@ typedef struct
 } UVM_QUERY_RESIDENCY_PARAMS;
 
 //
+// UvmSetGmemLimit
+//
+// Sets a per-va_space device-resident memory cap ("gmem"), in bytes, used by
+// per-tenant eviction: when the device is under memory pressure, a va_space
+// that is over its cap is preferred as the eviction victim, so a tenant within
+// its share is not evicted for an oversubscribing neighbour. A limit of 0
+// removes the cap. Also reports the va_space's current device-resident bytes,
+// so residency is observable. Added for gVisor GPU memory overcommit.
+//
+#define UVM_SET_GMEM_LIMIT                                            UVM_IOCTL_BASE(82)
+typedef struct
+{
+    NvU64           limit          NV_ALIGN_BYTES(8); // IN  (bytes; 0 = uncapped)
+    NvU64           residentBytes  NV_ALIGN_BYTES(8); // OUT (current device-resident bytes)
+    NV_STATUS       rmStatus;                         // OUT
+} UVM_SET_GMEM_LIMIT_PARAMS;
+
+//
 // Temporary ioctls which should be removed before UVM 8 release
 // Number backwards from 2047 - highest custom ioctl function number
 // windows can handle.

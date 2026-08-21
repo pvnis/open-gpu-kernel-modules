@@ -661,6 +661,25 @@ static void chunk_update_lists_locked(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk
         list_del_init(&chunk->list);
 }
 
+// gVisor GPU memory overcommit: adjust the owning tenant's device-resident byte
+// count. A "tenant" is a va_space (one per sandbox under gVisor); a chunk's
+// owner is chunk->va_block's va_space. Called when a user chunk becomes
+// ALLOCATED (delta > 0) and when it is freed or evicted (delta < 0). This is a
+// best-effort hint: the counter only steers per-tenant eviction victim
+// selection (pick_root_chunk_to_evict), so any drift changes which chunk is
+// evicted, never correctness.
+static void gmem_account_chunk(uvm_gpu_chunk_t *chunk, NvS64 delta)
+{
+    uvm_va_space_t *va_space;
+
+    if (!uvm_gpu_chunk_is_user(chunk) || !chunk->va_block)
+        return;
+
+    va_space = uvm_va_block_get_va_space_maybe_dead(chunk->va_block);
+    if (va_space)
+        atomic64_add(delta, &va_space->gmem_resident_bytes);
+}
+
 void uvm_pmm_gpu_unpin_allocated(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, uvm_va_block_t *va_block)
 {
     UVM_ASSERT(chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
@@ -673,6 +692,7 @@ void uvm_pmm_gpu_unpin_allocated(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, uvm
 
     chunk_unpin(pmm, chunk, UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
     chunk_update_lists_locked(pmm, chunk);
+    gmem_account_chunk(chunk, (NvS64)uvm_gpu_chunk_get_size(chunk));
 
     uvm_spin_unlock(&pmm->list_lock);
 }
@@ -1198,6 +1218,9 @@ void uvm_pmm_gpu_mark_chunk_evicted(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
     UVM_ASSERT(chunk->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
     UVM_ASSERT(chunk->va_block);
 
+    // gVisor overcommit: the chunk leaves its tenant's device-resident set.
+    gmem_account_chunk(chunk, -(NvS64)uvm_gpu_chunk_get_size(chunk));
+
     chunk->va_block = NULL;
     chunk_pin(pmm, chunk);
 
@@ -1482,6 +1505,43 @@ static uvm_gpu_chunk_t *get_first_allocated_chunk(uvm_pmm_gpu_t *pmm)
     return NULL;
 }
 
+// gVisor GPU memory overcommit: find the first allocated root chunk owned by a
+// va_space (tenant) that is over its device-resident cap ("gmem"), scanning the
+// eviction lists oldest-first like get_first_allocated_chunk. This makes an
+// oversubscribing tenant the eviction victim before a tenant within its share,
+// so overcommit does not turn into a noisy neighbour. Returns NULL when no
+// capped tenant is over its budget, in which case the caller falls back to the
+// global LRU (get_first_allocated_chunk) -- so this only ever changes which
+// chunk is evicted, never whether eviction succeeds. Caller holds list_lock.
+static uvm_gpu_chunk_t *get_over_budget_allocated_chunk(uvm_pmm_gpu_t *pmm)
+{
+    uvm_pmm_alloc_list_t alloc_list;
+
+    uvm_assert_spinlock_locked(&pmm->list_lock);
+
+    for (alloc_list = 0; alloc_list < UVM_PMM_ALLOC_LIST_COUNT; alloc_list++) {
+        uvm_gpu_chunk_t *chunk;
+
+        list_for_each_entry(chunk, &pmm->root_chunks.alloc_list[alloc_list], list) {
+            uvm_va_space_t *va_space;
+            NvS64 limit;
+
+            if (!chunk->va_block)
+                continue;
+
+            va_space = uvm_va_block_get_va_space_maybe_dead(chunk->va_block);
+            if (!va_space)
+                continue;
+
+            limit = atomic64_read(&va_space->gmem_limit_bytes);
+            if (limit > 0 && atomic64_read(&va_space->gmem_resident_bytes) > limit)
+                return chunk;
+        }
+    }
+
+    return NULL;
+}
+
 static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict(uvm_pmm_gpu_t *pmm)
 {
     uvm_gpu_chunk_t *chunk;
@@ -1505,6 +1565,12 @@ static uvm_gpu_root_chunk_t *pick_root_chunk_to_evict(uvm_pmm_gpu_t *pmm)
         if (chunk)
             UVM_ASSERT(chunk->is_zero);
     }
+
+    // gVisor overcommit: prefer evicting a tenant that is over its device-
+    // resident cap, so an oversubscriber does not evict a neighbour within its
+    // share. Falls through to the global LRU below when no tenant is over budget.
+    if (!chunk)
+        chunk = get_over_budget_allocated_chunk(pmm);
 
     // TODO: Bug 1765193: Move the chunks to the tail of the used list whenever
     // they get mapped.
@@ -2407,6 +2473,12 @@ static void free_chunk(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
                chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
 
     UVM_ASSERT(check_chunk(pmm, chunk));
+
+    // gVisor overcommit: an ALLOCATED user chunk being freed leaves its tenant's
+    // device-resident set. A chunk evicted via mark_chunk_evicted already had
+    // its va_block cleared, so gmem_account_chunk is a no-op here for it.
+    if (chunk->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED)
+        gmem_account_chunk(chunk, -(NvS64)uvm_gpu_chunk_get_size(chunk));
 
     if (try_chunk_free(pmm, chunk)) {
         try_free = is_root;

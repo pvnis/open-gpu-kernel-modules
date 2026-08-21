@@ -191,6 +191,17 @@ struct uvm_va_space_struct
     // Count of integrated GPUs in a VA space.
     NvU32 num_integrated_gpus;
 
+    // gVisor GPU memory overcommit: per-tenant device-residency accounting.
+    // gmem_resident_bytes tracks GPU device memory currently resident for this
+    // va_space; gmem_limit_bytes is its device-resident cap ("gmem"; 0 means
+    // uncapped). When the device is under memory pressure, eviction prefers a
+    // va_space that is over its cap, so a tenant within its share is not
+    // evicted for an oversubscribing neighbour. Both are atomic so the eviction
+    // path can read them without holding the va_space lock. Set via
+    // UVM_SET_GMEM_LIMIT.
+    atomic64_t gmem_resident_bytes;
+    atomic64_t gmem_limit_bytes;
+
     // Semaphore protecting the state of the va space
     uvm_rw_semaphore_t lock;
 

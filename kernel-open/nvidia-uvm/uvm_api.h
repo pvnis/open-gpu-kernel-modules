@@ -235,6 +235,7 @@ NV_STATUS uvm_api_register_gpu(UVM_REGISTER_GPU_PARAMS *params, struct file *fil
 NV_STATUS uvm_api_unregister_gpu(UVM_UNREGISTER_GPU_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_enable_peer_access(UVM_ENABLE_PEER_ACCESS_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_disable_peer_access(UVM_DISABLE_PEER_ACCESS_PARAMS *params, struct file *filp);
+NV_STATUS uvm_api_set_gmem_limit(UVM_SET_GMEM_LIMIT_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_create_external_range(UVM_CREATE_EXTERNAL_RANGE_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_map_external_allocation(UVM_MAP_EXTERNAL_ALLOCATION_PARAMS *params, struct file *filp);
 NV_STATUS uvm_api_map_external_sparse(UVM_MAP_EXTERNAL_SPARSE_PARAMS *params, struct file *filp);
