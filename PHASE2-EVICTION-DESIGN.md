@@ -85,7 +85,18 @@ quiesced.
 
 ## Status
 
-Design only. Next: implement (1) accounting + (3) the ioctl first (makes
-per-tenant residency observable and settable, independently useful), then (2)
-the scan-based victim selection, measure against S3, then the dual-list
-optimization.
+IMPLEMENTED + VALIDATED on hardware (2026-08-21, commit `551b9d88` here + the
+gVisor side on `gpu-overcommit`). All of (1) accounting, (2) scan-based victim
+selection, and (3) the `UVM_SET_GMEM_LIMIT` ioctl are in and the driver was
+loaded on the RTX 5070. Re-running S3 with a 4 GiB gmem cap: the innocent hot
+tenant holds **~131 GB/s (resident)** under a 16 GiB oversubscriber, versus
+**13.5 GB/s (evicted)** with the old global LRU — a ~10x improvement; the driver
+evicts the over-budget tenant, not the neighbour. The residual drop from 281 to
+131 is memory-bandwidth contention from the oversubscriber's paging DMA, which
+residency isolation does not address (separate problem, same class as CU masks
+not isolating VRAM bandwidth). Backward-compatible: with no cap set the global
+LRU is used unchanged.
+
+Follow-ups: the dual per-va_space CLOCK list (optimization over the O(n) scan);
+validate accounting precision under churn (splits/merges) via the ioctl's
+residency readout; and bandwidth isolation under a paging neighbour (open).
