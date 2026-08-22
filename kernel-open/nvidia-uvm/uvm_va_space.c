@@ -268,6 +268,7 @@ NV_STATUS uvm_va_space_create(struct address_space *mapping, uvm_va_space_t **va
     // gVisor GPU memory overcommit: start uncapped with zero resident bytes.
     atomic64_set(&va_space->gmem_resident_bytes, 0);
     atomic64_set(&va_space->gmem_limit_bytes, 0);
+    atomic64_set(&va_space->gmem_evicted_bytes, 0);
 
     bitmap_zero(va_space->enabled_peers, UVM_MAX_UNIQUE_GPU_PAIRS);
 
@@ -2156,6 +2157,10 @@ struct gmem_group_struct
     NvU64 id;
     atomic64_t resident;
     atomic64_t limit;
+    // Cumulative bytes evicted GPU->host for this tenant. Monotonic; the Sentry
+    // samples it as a rate to detect a thrashing oversubscriber (resident pinned
+    // at the cap while this keeps climbing).
+    atomic64_t evicted;
 };
 
 static LIST_HEAD(g_gmem_groups);
@@ -2179,6 +2184,7 @@ static gmem_group_t *gmem_group_lookup(NvU64 id)
         group->id = id;
         atomic64_set(&group->resident, 0);
         atomic64_set(&group->limit, 0);
+        atomic64_set(&group->evicted, 0);
         list_add(&group->list, &g_gmem_groups);
     }
 
@@ -2195,6 +2201,16 @@ void uvm_gmem_add_resident(uvm_va_space_t *va_space, NvS64 delta)
         atomic64_add(delta, &group->resident);
     else
         atomic64_add(delta, &va_space->gmem_resident_bytes);
+}
+
+void uvm_gmem_add_evicted(uvm_va_space_t *va_space, NvU64 size)
+{
+    gmem_group_t *group = va_space->gmem_group;
+
+    if (group)
+        atomic64_add((NvS64)size, &group->evicted);
+    else
+        atomic64_add((NvS64)size, &va_space->gmem_evicted_bytes);
 }
 
 bool uvm_gmem_over_budget(uvm_va_space_t *va_space)
@@ -2231,10 +2247,12 @@ NV_STATUS uvm_api_set_gmem_limit(UVM_SET_GMEM_LIMIT_PARAMS *params, struct file 
         va_space->gmem_group = group;
         atomic64_set(&group->limit, (long long)params->limit);
         params->residentBytes = (NvU64)atomic64_read(&group->resident);
+        params->evictedBytes = (NvU64)atomic64_read(&group->evicted);
     }
     else {
         atomic64_set(&va_space->gmem_limit_bytes, (long long)params->limit);
         params->residentBytes = (NvU64)atomic64_read(&va_space->gmem_resident_bytes);
+        params->evictedBytes = (NvU64)atomic64_read(&va_space->gmem_evicted_bytes);
     }
 
     return NV_OK;

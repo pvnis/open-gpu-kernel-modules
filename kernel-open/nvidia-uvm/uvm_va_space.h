@@ -193,6 +193,12 @@ typedef struct gmem_group_struct gmem_group_t;
 // eviction path.
 void uvm_gmem_add_resident(uvm_va_space_t *va_space, NvS64 delta);
 
+// Add to the va_space's tenant cumulative evicted-bytes counter (its group if it
+// has one, else the va_space itself). Monotonic; sampled as a rate it is the
+// thrash signal — a tenant pinned at its cap with a sustained nonzero eviction
+// rate is oversubscribing and paging every access. Lock-free; eviction-path safe.
+void uvm_gmem_add_evicted(uvm_va_space_t *va_space, NvU64 size);
+
 // Return true if the va_space's tenant is over its device-resident cap ("gmem").
 // Lock-free; callable from the eviction path.
 bool uvm_gmem_over_budget(uvm_va_space_t *va_space);
@@ -224,6 +230,11 @@ struct uvm_va_space_struct
     atomic64_t gmem_resident_bytes;
     atomic64_t gmem_limit_bytes;
     gmem_group_t *gmem_group;
+
+    // Cumulative bytes evicted GPU->host for this va_space when it is not in a
+    // tenant group (grouped tenants count on the group instead). Monotonic;
+    // sampled as a rate by the Sentry to detect a thrashing oversubscriber.
+    atomic64_t gmem_evicted_bytes;
 
     // Semaphore protecting the state of the va space
     uvm_rw_semaphore_t lock;

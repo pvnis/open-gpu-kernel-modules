@@ -683,6 +683,21 @@ static void gmem_account_chunk(uvm_gpu_chunk_t *chunk, NvS64 delta)
         uvm_gmem_add_resident(va_space, delta);
 }
 
+// Charge a chunk's GPU->host eviction to its tenant's monotonic evicted counter.
+// Same best-effort basis as gmem_account_chunk; called from the eviction path
+// while chunk->va_block is still valid.
+static void gmem_account_evicted(uvm_gpu_chunk_t *chunk)
+{
+    uvm_va_space_t *va_space;
+
+    if (!uvm_gpu_chunk_is_user(chunk) || !chunk->va_block)
+        return;
+
+    va_space = uvm_va_block_get_va_space_maybe_dead(chunk->va_block);
+    if (va_space)
+        uvm_gmem_add_evicted(va_space, (NvU64)uvm_gpu_chunk_get_size(chunk));
+}
+
 void uvm_pmm_gpu_unpin_allocated(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk, uvm_va_block_t *va_block)
 {
     UVM_ASSERT(chunk->state == UVM_PMM_GPU_CHUNK_STATE_TEMP_PINNED);
@@ -1221,7 +1236,11 @@ void uvm_pmm_gpu_mark_chunk_evicted(uvm_pmm_gpu_t *pmm, uvm_gpu_chunk_t *chunk)
     UVM_ASSERT(chunk->state == UVM_PMM_GPU_CHUNK_STATE_ALLOCATED);
     UVM_ASSERT(chunk->va_block);
 
-    // gVisor overcommit: the chunk leaves its tenant's device-resident set.
+    // gVisor overcommit: the chunk leaves its tenant's device-resident set, and
+    // this GPU->host page-out is charged to the tenant's monotonic evicted
+    // counter — the thrash signal the Sentry samples. Both read the chunk's
+    // va_space, so count before va_block is cleared below.
+    gmem_account_evicted(chunk);
     gmem_account_chunk(chunk, -(NvS64)uvm_gpu_chunk_get_size(chunk));
 
     chunk->va_block = NULL;
