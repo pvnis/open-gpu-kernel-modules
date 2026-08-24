@@ -348,16 +348,22 @@ ghostSchedFormatActive_GHOST(char *buf, int cap)
         if (dup)
             continue;
         seen[nSeen++] = g_ghostGroups[i].pid;
-        // active if any group of this pid is active
+        // active if any group of this pid is active; nTsg is how many groups it
+        // owns, which with a fixed per-TSG quantum is proportional to the share
+        // it actually takes -- the scheduler charges credit by it.
         act = NV_FALSE;
+        NvU32 nTsg = 0;
         for (j = 0; j < g_ghostGroupCount; j++)
-            if (g_ghostGroups[j].valid &&
-                g_ghostGroups[j].pid == g_ghostGroups[i].pid &&
-                g_ghostGroups[j].active)
-            { act = NV_TRUE; break; }
+            if (g_ghostGroups[j].valid && g_ghostGroups[j].nCh > 0 &&
+                g_ghostGroups[j].pid == g_ghostGroups[i].pid)
+            {
+                nTsg++;
+                if (g_ghostGroups[j].active)
+                    act = NV_TRUE;
+            }
         if (n < cap)
-            n += nvDbgSnprintf(buf + n, cap - n, "pid %u active %d\n",
-                               g_ghostGroups[i].pid, act ? 1 : 0);
+            n += nvDbgSnprintf(buf + n, cap - n, "pid %u active %d tsgs %u\n",
+                               g_ghostGroups[i].pid, act ? 1 : 0, nTsg);
     }
     return n;
 }

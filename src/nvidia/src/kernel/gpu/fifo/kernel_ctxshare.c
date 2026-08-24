@@ -56,7 +56,7 @@
 // GPFIFO_SCHEDULE path, by which point the object is registered with GSP. The
 // pair of results discriminates "called too early" from "die lacks the feature".
 #define GHOST_MAX_DEFERRED 128
-#define GHOST_TOTAL_TPC     54   // A100: 108 SMs / 2 SMs per TPC
+#define GHOST_TOTAL_TPC     24   // RTX 5070: 48 SMs / 2 SMs per TPC
 typedef struct
 {
     NvHandle hClient;
