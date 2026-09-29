@@ -69,7 +69,16 @@ extern NvU32 ghostTenantIndex_GHOST(void);
 // DetachTSG/AttachTSG. The policy (who runs when, work-conservation) lives in
 // the userspace scheduler; this code only enforces its decisions.
 // ============================================================================
-#define GHOST_MAX_GROUPS 256
+//
+// GHOST_MAX_GROUPS is the most channel groups the broker tracks at once, and
+// GHOST_MAX_GROUPS_PER_TENANT the most one tenant (one pid: under gVisor, one
+// sandbox's Sentry) may hold of them. An 8-GPU NCCL job holds ~110. The cap is
+// what keeps one tenant from filling the table: once the scheduler is driving
+// the broker, a group that cannot be tracked is refused, so a full table would
+// otherwise deny every other tenant's new contexts.
+//
+#define GHOST_MAX_GROUPS            2048
+#define GHOST_MAX_GROUPS_PER_TENANT 512
 typedef struct
 {
     NvU32     pid;        // owning process (the KVM Sentry, one per sandbox)
@@ -100,6 +109,15 @@ static GHOST_GROUP g_ghostGroups[GHOST_MAX_GROUPS];
 static NvU32       g_ghostGroupCount = 0;
 static OBJGPU     *g_ghostGpu = NULL;
 static NvBool      g_ghostFullWarned = NV_FALSE;
+//
+// Set once anything drives /proc/driver/nvidia/gpusched (the scheduler polls
+// every tick). From then on the broker fails closed: a channel group it cannot
+// track is refused rather than scheduled, because an untracked group can never
+// be detached and so runs unthrottled -- measured on B300 as a weight-25
+// tenant taking 814 TFLOPS against its weight-75 neighbour's 371 once the
+// table was full. Without a scheduler nothing is refused.
+//
+static NvBool      g_ghostArmed = NV_FALSE;
 
 //
 // Running totals of what the broker has done, reported on the "stats" line of
@@ -115,20 +133,23 @@ static struct
     NvU64 restartsGone;   // NV_ERR_INVALID_STATE: channels being torn down
     NvU64 restartsFailed;
     NvU64 tableFull;
+    NvU64 refused;        // groups refused scheduling because they could not be tracked
 } g_ghostStats;
 
 // ghostSchedRecord_GHOST: remember a channel group and its channels, keyed by
 // the calling process, so a later detach/attach can find them. Called from the
-// GPFIFO_SCHEDULE hook while the group is being enabled.
-void
+// GPFIFO_SCHEDULE hook before the group is enabled. Returns NV_FALSE if the
+// group could not be tracked: the table is full, or the tenant already holds
+// GHOST_MAX_GROUPS_PER_TENANT groups.
+static NvBool
 ghostSchedRecord_GHOST(OBJGPU *pGpu, NvU32 pid, NvHandle hClient,
                        NvHandle hGroup, KernelChannelGroup *pKcg)
 {
-    NvU32 i, slot;
+    NvU32 i, slot, held = 0;
     CHANNEL_NODE *pNode;
 
     if (pKcg == NULL || pKcg->pChanList == NULL)
-        return;
+        return NV_TRUE; // nothing to track
     g_ghostGpu = pGpu;
 
     // Reuse a slot for the same (pid, hClient, hGroup) if we already have one;
@@ -153,24 +174,27 @@ ghostSchedRecord_GHOST(OBJGPU *pGpu, NvU32 pid, NvHandle hClient,
                 slot = i;
                 break;
             }
+            if (g_ghostGroups[i].pid == pid)
+                held++;
         }
         if (freeSlot != GHOST_MAX_GROUPS)
             slot = freeSlot;
     }
-    if (slot >= GHOST_MAX_GROUPS)
+    if ((slot < g_ghostGroupCount) && g_ghostGroups[slot].valid)
+        return NV_TRUE; // already tracked (re-enable of the same group)
+    if ((slot >= GHOST_MAX_GROUPS) || (held >= GHOST_MAX_GROUPS_PER_TENANT))
     {
-        // An untracked group is one the scheduler can never detach, so the
-        // tenant runs unthrottled: this is a fail-open, and must be loud.
         g_ghostStats.tableFull++;
         if (!g_ghostFullWarned)
         {
             NV_PRINTF(LEVEL_ERROR,
-                      "GHOST sched: group table full (%u); pid %u group 0x%08x "
-                      "is NOT tracked and will not be throttled\n",
-                      GHOST_MAX_GROUPS, pid, hGroup);
+                      "GHOST sched: cannot track pid %u group 0x%08x (%s); it will be %s\n",
+                      pid, hGroup,
+                      (slot >= GHOST_MAX_GROUPS) ? "table full" : "tenant at its cap",
+                      g_ghostArmed ? "refused" : "untracked and unthrottled");
             g_ghostFullWarned = NV_TRUE;
         }
-        return;
+        return NV_FALSE;
     }
 
     portMemSet(&g_ghostGroups[slot], 0, sizeof(g_ghostGroups[slot]));
@@ -190,6 +214,7 @@ ghostSchedRecord_GHOST(OBJGPU *pGpu, NvU32 pid, NvHandle hClient,
     g_ghostGroups[slot].valid = NV_TRUE;
     if (slot == g_ghostGroupCount)
         g_ghostGroupCount++;
+    return NV_TRUE;
 }
 
 // ghostSchedForget_GHOST: release the slot recorded for (hClient, hGroup).
@@ -253,18 +278,21 @@ ghostRestartRunlist(OBJGPU *pGpu, NvHandle hClient, NvHandle hChannel)
     NV_RM_RPC_CONTROL(pGpu, hClient, hChannel,
                       NVA06F_CTRL_CMD_RESTART_RUNLIST, &rr, sizeof(rr), st);
     //
-    // GSP answers NV_ERR_INVALID_STATE for channels being torn down: the
+    // GSP answers NV_ERR_INVALID_STATE for channels being torn down, and
+    // NV_ERR_OBJECT_NOT_FOUND once a channel is freed ahead of its group: the
     // scheduler learns a tenant has exited only at its next poll, so a
     // command in the tenant's last moments lands on channels mid-teardown.
-    // Measured on B300: every such failure fell in a tenant's final second.
+    // Measured on B300: every such failure fell in a dying tenant's last
+    // seconds (a process exiting, or one whose contexts were refused).
     //
+    NvBool bGone = (st == NV_ERR_INVALID_STATE) || (st == NV_ERR_OBJECT_NOT_FOUND);
     if (st == NV_OK)
         g_ghostStats.restartsOk++;
-    else if (st == NV_ERR_INVALID_STATE)
+    else if (bGone)
         g_ghostStats.restartsGone++;
     else
         g_ghostStats.restartsFailed++;
-    NV_PRINTF((st == NV_OK || st == NV_ERR_INVALID_STATE) ? LEVEL_INFO : LEVEL_ERROR,
+    NV_PRINTF((st == NV_OK || bGone) ? LEVEL_INFO : LEVEL_ERROR,
               "GHOST sched: RESTART_RUNLIST chan 0x%08x -> 0x%x\n", hChannel, st);
 }
 
@@ -431,6 +459,8 @@ ghostSchedQueue_GHOST(NvU32 pid, NvU32 action, NvU32 arg, NvU64 gpu)
         (void)ghostSchedFormatActive_GHOST(tmp, 0);
     }
 
+    // A scheduler is driving the broker: from now on, fail closed.
+    g_ghostArmed = NV_TRUE;
     if (g_ghostGpu == NULL)
         return;
     pWi = portMemAllocNonPaged(sizeof(*pWi));
@@ -458,20 +488,23 @@ ghostSchedFormatActive_GHOST(char *buf, int cap)
 {
     NvU32 i, j;
     int n = 0;
-    NvU32 seen[GHOST_MAX_GROUPS];
-    NvU32 nSeen = 0;
 
-    for (i = 0; i < g_ghostGroupCount && nSeen < GHOST_MAX_GROUPS; i++)
+    for (i = 0; i < g_ghostGroupCount; i++)
     {
         NvBool dup = NV_FALSE;
         NvBool act;
         if (!g_ghostGroups[i].valid)
             continue;
-        for (j = 0; j < nSeen; j++)
-            if (seen[j] == g_ghostGroups[i].pid) { dup = NV_TRUE; break; }
+        // Report each pid once, at its first group. (No per-slot scratch
+        // array: at GHOST_MAX_GROUPS entries it would not fit a kernel stack.)
+        for (j = 0; j < i; j++)
+            if (g_ghostGroups[j].valid && g_ghostGroups[j].pid == g_ghostGroups[i].pid)
+            {
+                dup = NV_TRUE;
+                break;
+            }
         if (dup)
             continue;
-        seen[nSeen++] = g_ghostGroups[i].pid;
         // active if any group of this pid is active; nTsg is how many groups it
         // owns, which with a fixed per-TSG quantum is proportional to the share
         // it actually takes -- the scheduler charges credit by it.
@@ -538,10 +571,11 @@ ghostSchedFormatActive_GHOST(char *buf, int cap)
     if (n < cap)
         n += nvDbgSnprintf(buf + n, cap - n,
                            "stats cmds_ok %llu cmds_failed %llu restarts_ok %llu "
-                           "restarts_teardown %llu restarts_failed %llu table_full %llu\n",
+                           "restarts_teardown %llu restarts_failed %llu table_full %llu refused %llu\n",
                            g_ghostStats.cmdsOk, g_ghostStats.cmdsFailed,
                            g_ghostStats.restartsOk, g_ghostStats.restartsGone,
-                           g_ghostStats.restartsFailed, g_ghostStats.tableFull);
+                           g_ghostStats.restartsFailed, g_ghostStats.tableFull,
+                           g_ghostStats.refused);
     return n;
 }
 
@@ -1684,6 +1718,22 @@ kchangrpapiCtrlCmdGpFifoSchedule_IMPL
         RmCtrlParams *pRmCtrlParams = pCallContext->pControlParams;
         NvHandle hClient = RES_GET_CLIENT_HANDLE(pKernelChannelGroupApi);
         NvHandle hObject = RES_GET_HANDLE(pKernelChannelGroupApi);
+        NvBool   bTracked = NV_FALSE;
+
+        // === GHOST GPU SCHEDULER: record this tenant's channels BEFORE the
+        // group reaches the runlist, so a later detach/attach can find them.
+        // A group that cannot be tracked is refused once a scheduler is
+        // driving the broker: scheduled untracked, it could never be detached.
+        if ((pSchedParams != NULL) && pSchedParams->bEnable)
+        {
+            bTracked = ghostSchedRecord_GHOST(pGpu, osGetCurrentProcess(), hClient, hObject,
+                                              pKernelChannelGroupApi->pKernelChannelGroup);
+            if (!bTracked && g_ghostArmed)
+            {
+                g_ghostStats.refused++;
+                return NV_ERR_INSUFFICIENT_RESOURCES;
+            }
+        }
 
         NV_RM_RPC_CONTROL(pGpu,
                           hClient,
@@ -1692,6 +1742,8 @@ kchangrpapiCtrlCmdGpFifoSchedule_IMPL
                           pRmCtrlParams->pParams,
                           pRmCtrlParams->paramsSize,
                           status);
+        if (bTracked && (status != NV_OK))
+            ghostSchedForget_GHOST(hClient, hObject);
 
         // === GHOST EXPERIMENT (Phase 0b): after the sandbox enables its channel
         // group, force it back OFF from inside RM, to test whether a driver-level
@@ -1797,13 +1849,8 @@ kchangrpapiCtrlCmdGpFifoSchedule_IMPL
             }
         }
 
-        // === GHOST GPU SCHEDULER: record this tenant's channels so a later
-        // detach/attach (driven by the userspace scheduler via
-        // /proc/driver/nvidia/gpusched) can find them. The detach itself is no
-        // longer done here unconditionally; it is issued on command. The
-        // GhostPreempt knob is kept below as a static self-test only.
-        ghostSchedRecord_GHOST(pGpu, osGetCurrentProcess(), hClient, hObject,
-                               pKernelChannelGroupApi->pKernelChannelGroup);
+        // (This tenant's channels were recorded above, before the enable.
+        // The GhostPreempt knob is kept below as a static self-test only.)
         {
             NvU32 ghostPreempt = 0;
             if (osReadRegistryDword(pGpu, "GhostPreempt", &ghostPreempt) != NV_OK)

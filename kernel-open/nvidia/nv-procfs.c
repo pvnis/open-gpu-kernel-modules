@@ -537,10 +537,11 @@ extern int ghostSchedFormatActive_GHOST(char *buf, int cap);
 #define GHOST_ALL_GPUS (~0ULL)
 
 // Room for every line the formatter can produce: one per-pid line and one
-// per-(pid, GPU) line for each of the driver's 256 group slots, each well
-// under 64 bytes. A fixed 2 KiB buffer truncated the report at ~68 tenants,
-// and a tenant missing from it looks idle to the scheduler.
-#define GHOST_SHOW_BUF_SIZE (2 * 256 * 64)
+// per-(pid, GPU) line for each of the driver's GHOST_MAX_GROUPS (2048) group
+// slots, each well under 64 bytes, plus the stats line. A fixed 2 KiB buffer
+// truncated the report at ~68 tenants, and a tenant missing from it looks
+// idle to the scheduler. Keep in step with kernel_channel_group_api.c.
+#define GHOST_SHOW_BUF_SIZE (2 * 2048 * 64 + 256)
 
 static int
 nv_procfs_show_gpusched(struct seq_file *m, void *v)
