@@ -202,8 +202,22 @@ ghostSchedForget_GHOST(NvHandle hClient, NvHandle hGroup)
         g_ghostGroupCount--;
 }
 
+// GHOST_ALL_GPUS in a command's gpu field applies it to the tenant's groups on
+// every GPU, which is what a command without a bus ID means.
+#define GHOST_ALL_GPUS (~0ULL)
+
+// ghostGpuAddr_GHOST returns the PCI address a command names a GPU by, in the
+// layout gpuEncodeDomainBusDevice() uses (domain 63:32, bus 15:8, slot 7:0).
+// The procfs parser in kernel-open builds the same value from "DDDD:BB:SS.F".
+static NvU64
+ghostGpuAddr_GHOST(OBJGPU *pGpu)
+{
+    return gpuEncodeDomainBusDevice(gpuGetDomain(pGpu), gpuGetBus(pGpu),
+                                    gpuGetDevice(pGpu));
+}
+
 // Parameters carried to the work item.
-typedef struct { NvU32 pid; NvU32 action; NvU32 arg; } GHOST_SCHED_WI;
+typedef struct { NvU32 pid; NvU32 action; NvU32 arg; NvU64 gpu; } GHOST_SCHED_WI;
 // action: 0=attach, 1=detach(+RESTART_RUNLIST), 2=set-timeslice arg=us (+RESTART)
 
 // ghostRestartRunlist: force GSP to expire the current timeslice and restart the
@@ -249,6 +263,15 @@ ghostSchedWorkItem(NvU32 gpuInstance, void *pParams)
         if (!g_ghostGroups[i].valid || g_ghostGroups[i].nCh == 0 || pGpu == NULL)
             continue;
         if (pWi->action != 3 && g_ghostGroups[i].pid != pWi->pid)
+            continue;
+        //
+        // A command naming a GPU acts only on the tenant's groups there. The
+        // scheduler divides each GPU separately, so a sandbox holding several
+        // GPUs that has overdrawn its share of one must not be taken off the
+        // runlist of the others as well.
+        //
+        if (pWi->action != 3 && pWi->gpu != GHOST_ALL_GPUS &&
+            ghostGpuAddr_GHOST(pGpu) != pWi->gpu)
             continue;
 
         if (pWi->action == 3)
@@ -357,7 +380,7 @@ done:
 int ghostSchedFormatActive_GHOST(char *buf, int cap); // defined below
 
 void
-ghostSchedQueue_GHOST(NvU32 pid, NvU32 action, NvU32 arg)
+ghostSchedQueue_GHOST(NvU32 pid, NvU32 action, NvU32 arg, NvU64 gpu)
 {
     GHOST_SCHED_WI *pWi;
     OsQueueWorkItemFlags flags;
@@ -379,6 +402,7 @@ ghostSchedQueue_GHOST(NvU32 pid, NvU32 action, NvU32 arg)
     pWi->pid = pid;
     pWi->action = action;
     pWi->arg = arg;
+    pWi->gpu = gpu;
 
     portMemSet(&flags, 0, sizeof(flags));
     flags.bRequiresGpu = NV_TRUE;
@@ -426,6 +450,50 @@ ghostSchedFormatActive_GHOST(char *buf, int cap)
             }
         if (n < cap)
             n += nvDbgSnprintf(buf + n, cap - n, "pid %u active %d tsgs %u\n",
+                               g_ghostGroups[i].pid, act ? 1 : 0, nTsg);
+    }
+
+    //
+    // The same, per GPU: "dev DDDD:BB:SS.0 pid <p> active <0|1> tsgs <n>" for
+    // each (tenant, GPU) it holds groups on. The scheduler divides every GPU
+    // separately, so it needs activity and group counts per GPU; a sandbox
+    // busy on one of its GPUs is not contending for the others. These lines
+    // come after the per-pid ones and do not start with "pid", so a reader
+    // that knows only the per-pid format skips them.
+    //
+    for (i = 0; i < g_ghostGroupCount; i++)
+    {
+        NvBool dup = NV_FALSE;
+        NvBool act = NV_FALSE;
+        NvU32 nTsg = 0;
+        OBJGPU *pGpu = g_ghostGroups[i].pGpu;
+
+        if (!g_ghostGroups[i].valid || g_ghostGroups[i].nCh == 0 || pGpu == NULL)
+            continue;
+        // Report each (pid, GPU) once, at its first group.
+        for (j = 0; j < i; j++)
+            if (g_ghostGroups[j].valid && g_ghostGroups[j].nCh > 0 &&
+                g_ghostGroups[j].pid == g_ghostGroups[i].pid &&
+                g_ghostGroups[j].pGpu == pGpu)
+            {
+                dup = NV_TRUE;
+                break;
+            }
+        if (dup)
+            continue;
+        for (j = i; j < g_ghostGroupCount; j++)
+            if (g_ghostGroups[j].valid && g_ghostGroups[j].nCh > 0 &&
+                g_ghostGroups[j].pid == g_ghostGroups[i].pid &&
+                g_ghostGroups[j].pGpu == pGpu)
+            {
+                nTsg++;
+                if (g_ghostGroups[j].active)
+                    act = NV_TRUE;
+            }
+        if (n < cap)
+            n += nvDbgSnprintf(buf + n, cap - n,
+                               "dev %04x:%02x:%02x.0 pid %u active %d tsgs %u\n",
+                               gpuGetDomain(pGpu), gpuGetBus(pGpu), gpuGetDevice(pGpu),
                                g_ghostGroups[i].pid, act ? 1 : 0, nTsg);
     }
     return n;
@@ -1698,7 +1766,7 @@ kchangrpapiCtrlCmdGpFifoSchedule_IMPL
                 pSchedParams->bEnable && (status == NV_OK) &&
                 (ghostTenantIndex_GHOST() >= 1))
             {
-                ghostSchedQueue_GHOST(osGetCurrentProcess(), 1, 0); // 1=detach
+                ghostSchedQueue_GHOST(osGetCurrentProcess(), 1, 0, GHOST_ALL_GPUS); // 1=detach
             }
         }
 

@@ -529,19 +529,90 @@ static nv_proc_ops_t nv_procfs_registry_fops = {
     .NV_PROC_OPS_RELEASE = nv_procfs_close_registry,
 };
 
-extern void ghostSchedQueue_GHOST(NvU32 pid, NvU32 action, NvU32 arg);
+extern void ghostSchedQueue_GHOST(NvU32 pid, NvU32 action, NvU32 arg, NvU64 gpu);
 extern int ghostSchedFormatActive_GHOST(char *buf, int cap);
+
+// GHOST_ALL_GPUS must match kernel_channel_group_api.c: a command with no GPU
+// named applies to every GPU the tenant holds groups on.
+#define GHOST_ALL_GPUS (~0ULL)
+
+// Room for every line the formatter can produce: one per-pid line and one
+// per-(pid, GPU) line for each of the driver's 256 group slots, each well
+// under 64 bytes. A fixed 2 KiB buffer truncated the report at ~68 tenants,
+// and a tenant missing from it looks idle to the scheduler.
+#define GHOST_SHOW_BUF_SIZE (2 * 256 * 64)
 
 static int
 nv_procfs_show_gpusched(struct seq_file *m, void *v)
 {
     // Report the cached per-tenant activity from the last "poll". A reader
     // (the GPU scheduler) writes "poll" to refresh it, then reads this.
-    char buf[2048];
-    int n = ghostSchedFormatActive_GHOST(buf, sizeof(buf) - 1);
-    buf[n < 0 ? 0 : (n < (int)sizeof(buf) ? n : (int)sizeof(buf) - 1)] = '\0';
+    char *buf = NULL;
+    int n;
+
+    if (os_alloc_mem((void **)&buf, GHOST_SHOW_BUF_SIZE) != NV_OK)
+        return -ENOMEM;
+    n = ghostSchedFormatActive_GHOST(buf, GHOST_SHOW_BUF_SIZE - 1);
+    buf[n < 0 ? 0 : (n < GHOST_SHOW_BUF_SIZE ? n : GHOST_SHOW_BUF_SIZE - 1)] = '\0';
     seq_printf(m, "%s", buf);
+    os_free_mem(buf);
     return 0;
+}
+
+// ghost_parse_hex parses hex digits at *pn, advancing it, and returns false if
+// there were none.
+static NvBool
+ghost_parse_hex(const char *s, size_t *pn, NvU32 *out)
+{
+    size_t n = *pn;
+    NvU32 v = 0;
+    while (1)
+    {
+        char c = s[n];
+        if (c >= '0' && c <= '9')      v = (v << 4) | (NvU32)(c - '0');
+        else if (c >= 'a' && c <= 'f') v = (v << 4) | (NvU32)(c - 'a' + 10);
+        else if (c >= 'A' && c <= 'F') v = (v << 4) | (NvU32)(c - 'A' + 10);
+        else break;
+        n++;
+    }
+    if (n == *pn)
+        return NV_FALSE;
+    *pn = n;
+    *out = v;
+    return NV_TRUE;
+}
+
+// ghost_parse_gpu parses an optional trailing PCI address "DDDD:BB:SS[.F]",
+// as nvidia-smi and /proc/driver/nvidia/gpus name a GPU, into the value
+// gpuEncodeDomainBusDevice() produces (domain 63:32, bus 15:8, slot 7:0). It
+// sets *gpu to GHOST_ALL_GPUS if nothing follows, and returns false if what
+// follows is not an address.
+static NvBool
+ghost_parse_gpu(const char *s, size_t n, NvU64 *gpu)
+{
+    NvU32 domain, bus, slot, fn;
+
+    while (s[n] == ' ' || s[n] == '\t') n++;
+    if (s[n] == '\0' || s[n] == '\n')
+    {
+        *gpu = GHOST_ALL_GPUS;
+        return NV_TRUE;
+    }
+    if (!ghost_parse_hex(s, &n, &domain) || s[n++] != ':' ||
+        !ghost_parse_hex(s, &n, &bus) || s[n++] != ':' ||
+        !ghost_parse_hex(s, &n, &slot))
+        return NV_FALSE;
+    if (s[n] == '.')
+    {
+        n++;
+        if (!ghost_parse_hex(s, &n, &fn))
+            return NV_FALSE;
+    }
+    while (s[n] == ' ' || s[n] == '\t' || s[n] == '\n') n++;
+    if (s[n] != '\0' || bus > 0xff || slot > 0xff)
+        return NV_FALSE;
+    *gpu = ((NvU64)domain << 32) | ((NvU64)bus << 8) | (NvU64)slot;
+    return NV_TRUE;
 }
 
 static ssize_t
@@ -567,9 +638,10 @@ nv_procfs_write_gpusched(
 
     NvU32 action;
     NvU32 arg = 0;
+    NvU64 gpu = GHOST_ALL_GPUS;
     if (strncmp(kbuf, "poll", 4) == 0)
     {
-        ghostSchedQueue_GHOST(0, 3, 0); // sweep all tenants, refresh activity
+        ghostSchedQueue_GHOST(0, 3, 0, GHOST_ALL_GPUS); // sweep all tenants, refresh activity
         return count;
     }
     if (strncmp(kbuf, "detach", 6) == 0)      { action = 1; n = 6; }
@@ -586,7 +658,11 @@ nv_procfs_write_gpusched(
         while (kbuf[n] == ' ' || kbuf[n] == '\t') n++;
         while (kbuf[n] >= '0' && kbuf[n] <= '9') { arg = arg * 10 + (NvU32)(kbuf[n] - '0'); n++; }
     }
-    ghostSchedQueue_GHOST(pid, action, arg);
+    // Optionally "... <DDDD:BB:SS.F>": act on the tenant's groups on that GPU
+    // only. Without it the command applies to all of them, as it always has.
+    if (!ghost_parse_gpu(kbuf, n, &gpu))
+        return -EINVAL;
+    ghostSchedQueue_GHOST(pid, action, arg, gpu);
     return count;
 }
 

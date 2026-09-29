@@ -167,12 +167,20 @@ Measured on a multi-GPU node; see
   GPU's lock (`bLockGpus` => `GPU_LOCK_GRP_ALL`). Verified: `SET_TIMESLICE`
   155/155 OK on an 8-GPU pod, and a 75/25 pair on one GPU held 3.06:1 while
   another pod created 26 contexts on a different GPU.
-- **Still open: control is per pid, not per GPU.** `detach/attach/ts <pid>`
-  act on all of that pid's groups on every GPU, while `runsc gpu-scheduler`
-  divides each GPU separately. A multi-GPU sandbox that shares one of its GPUs
-  would be detached on all of them during another tenant's window on the
-  shared one. Fixing this needs a GPU qualifier on the procfs commands and in
-  `pkg/gpusched`'s enforcer.
+- **FIXED (b300-multigpu): control was per pid, not per GPU.**
+  `detach/attach/ts <pid>` acted on all of a tenant's groups on every GPU,
+  while `runsc gpu-scheduler` divides each GPU separately. Commands now take an
+  optional trailing PCI address (`detach <pid> 0000:07:00.0`,
+  `ts <pid> <us> 0000:07:00.0`) and then act only on the tenant's groups on
+  that GPU; without one they act on all, as before. `poll` output keeps its
+  `pid <p> active <a> tsgs <n>` lines and adds
+  `dev <DDDD:BB:SS.0> pid <p> active <a> tsgs <n>` per (tenant, GPU). Those
+  lines do not start with `pid`, so an older reader skips them. The read
+  buffer grew from 2 KiB (truncated at ~68 tenants, and a truncated tenant
+  looks idle) to fit the whole table. The scheduler half is on the gvisor
+  `b300-multigpu` branch. Verified: a weight-25 pod on two GPUs, sharing one
+  with a weight-75 pod, ran at 1313 TFLOPS on its unshared GPU and split the
+  shared one 329 : 1022 (1 : 3.1).
 - Some `RESTART_RUNLIST` calls return `NV_ERR_INVALID_STATE` (0x40), about 27%
   of them on an 8-GPU NCCL pod, presumably for channels not currently on a
   runlist. Detach and timeslice succeed regardless; this was previously hidden
