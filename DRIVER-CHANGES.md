@@ -181,10 +181,27 @@ Measured on a multi-GPU node; see
   `b300-multigpu` branch. Verified: a weight-25 pod on two GPUs, sharing one
   with a weight-75 pod, ran at 1313 TFLOPS on its unshared GPU and split the
   shared one 329 : 1022 (1 : 3.1).
-- Some `RESTART_RUNLIST` calls return `NV_ERR_INVALID_STATE` (0x40), about 27%
-  of them on an 8-GPU NCCL pod, presumably for channels not currently on a
-  runlist. Detach and timeslice succeed regardless; this was previously hidden
-  behind the 0x57s above.
+- **FIXED (b300-multigpu): `RESTART_RUNLIST` → `NV_ERR_INVALID_STATE` (0x40),
+  and the log flood.** Every remaining 0x40 fell in a tenant's final second:
+  the scheduler learns a tenant has exited only at its next poll, so a command
+  issued in its last moments lands on channels mid-teardown. It is benign, and
+  is now counted as `restarts_teardown` rather than logged as an error. More
+  generally, every broker command used to log at `LEVEL_ERROR`, which is about
+  7 lines/s on a busy node (21,000 lines in 50 minutes). Successes now log at
+  `LEVEL_INFO`, which release builds do not print; real failures stay at error
+  level. Totals go on a `stats` line at the end of `/proc/driver/nvidia/gpusched`:
+  `stats cmds_ok N cmds_failed N restarts_ok N restarts_teardown N restarts_failed N table_full N`.
+  Readers that know only the `pid`/`dev` lines skip it.
+- **FIXED (b300-multigpu): the partition probes ran on every CUDA context.**
+  The 0c/0d probes in `kctxshareapiConstruct_IMPL` issued TPC-partition-mode,
+  partition-table and CWD-watermark controls on every ctxshare. The deferred 0e
+  re-probe defaulted to a **27-TPC partition** unless `GhostTpcCount` was set,
+  which is the trap `gvisor/A100-CLUSTER.md` records. They are experiment
+  scaffolding, so they are now off unless loaded with `GhostProbe=1`, and
+  `GhostTpcCount` defaults to 0 (no partition). The runlist broker does not
+  depend on them. The experiment scripts need `GhostProbe=1` added to their
+  `NVreg_RegistryDwords`. Their `g_ghostDeferred[128]` table also never frees
+  entries, but it is only filled while probing is on.
 - `srcversion` is **not** a reliable "did my build load" check for changes
   under `src/nvidia/` (RM core is a prebuilt object, not hashed into it). Use
   the build timestamp in the `NVRM: loading ... Release Build (... <date>)`

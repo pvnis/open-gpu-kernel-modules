@@ -84,6 +84,23 @@ NvU32          g_ghostNextBase = 0;
 NvU32 g_ghostTenants[GHOST_MAX_TENANTS];
 NvU32 g_ghostTenantCount = 0;
 
+//
+// ghostProbesEnabled_GHOST says whether the partition probes (0c/0d at ctxshare
+// construction, 0e at GPFIFO_SCHEDULE) may run. They are experiment scaffolding
+// that issues TPC-partition and CWD-watermark controls on every context, so
+// they are off unless the load asks for them:
+//   insmod nvidia.ko NVreg_RegistryDwords="GhostProbe=1;GhostTpcCount=13"
+// The runlist broker (/proc/driver/nvidia/gpusched) does not depend on them.
+//
+static NvBool
+ghostProbesEnabled_GHOST(OBJGPU *pGpu)
+{
+    NvU32 probe = 0;
+    if (osReadRegistryDword(pGpu, "GhostProbe", &probe) != NV_OK)
+        return NV_FALSE;
+    return probe != 0;
+}
+
 NvU32
 ghostTenantIndex_GHOST(void)
 {
@@ -252,7 +269,7 @@ kctxshareapiConstruct_IMPL
     // worth testing on datacenter/pro dies (RTX A6000 GA102, RTX 6000 Pro
     // Blackwell GB202, A100/H100). GHOST_TPC_COUNT is hardcoded for the test; a
     // real version keys it on a per-sandbox weight and picks disjoint ranges.
-    if (rmStatus == NV_OK)
+    if ((rmStatus == NV_OK) && ghostProbesEnabled_GHOST(GPU_RES_GET_GPU(pKernelCtxShareApi)))
     {
         enum { GHOST_TPC_COUNT = 27 };  // half of the A100's 54 TPCs (108 SMs); adjust per GPU
         RM_API   *pRmApi    = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
@@ -398,13 +415,19 @@ ghostReprobeDeferred_GHOST(OBJGPU *pGpu)
     //   GhostDisjoint  = 1 => lay each tenant's range after the previous one's
     //   GhostWatermark = 1 => also clamp the CWD watermark to MIN
     //
-    NvU32 ghostTpcCount = 27;
+    NvU32 ghostTpcCount = 0;
     NvU32 ghostTpcCountB = 0;
     NvU32 ghostWatermark = 0;
     NvU32 ghostDisjoint = 0;
 
+    //
+    // No partition unless one is asked for. This used to default to 27 TPCs,
+    // which silently capped every context on any GPU the knob was not set for.
+    //
+    if (!ghostProbesEnabled_GHOST(pGpu))
+        return;
     if (osReadRegistryDword(pGpu, "GhostTpcCount", &ghostTpcCount) != NV_OK)
-        ghostTpcCount = 27;
+        ghostTpcCount = 0;
     if (osReadRegistryDword(pGpu, "GhostTpcCountB", &ghostTpcCountB) != NV_OK)
         ghostTpcCountB = 0;
     if (osReadRegistryDword(pGpu, "GhostWatermark", &ghostWatermark) != NV_OK)

@@ -101,6 +101,22 @@ static NvU32       g_ghostGroupCount = 0;
 static OBJGPU     *g_ghostGpu = NULL;
 static NvBool      g_ghostFullWarned = NV_FALSE;
 
+//
+// Running totals of what the broker has done, reported on the "stats" line of
+// /proc/driver/nvidia/gpusched. Individual commands are logged only at
+// LEVEL_INFO: the scheduler issues several a second per tenant, and at
+// LEVEL_ERROR they flooded the kernel log (~7 lines/s on one node).
+//
+static struct
+{
+    NvU64 cmdsOk;
+    NvU64 cmdsFailed;
+    NvU64 restartsOk;
+    NvU64 restartsGone;   // NV_ERR_INVALID_STATE: channels being torn down
+    NvU64 restartsFailed;
+    NvU64 tableFull;
+} g_ghostStats;
+
 // ghostSchedRecord_GHOST: remember a channel group and its channels, keyed by
 // the calling process, so a later detach/attach can find them. Called from the
 // GPFIFO_SCHEDULE hook while the group is being enabled.
@@ -145,6 +161,7 @@ ghostSchedRecord_GHOST(OBJGPU *pGpu, NvU32 pid, NvHandle hClient,
     {
         // An untracked group is one the scheduler can never detach, so the
         // tenant runs unthrottled: this is a fail-open, and must be loud.
+        g_ghostStats.tableFull++;
         if (!g_ghostFullWarned)
         {
             NV_PRINTF(LEVEL_ERROR,
@@ -235,7 +252,19 @@ ghostRestartRunlist(OBJGPU *pGpu, NvHandle hClient, NvHandle hChannel)
     rr.bBypassWait   = NV_FALSE;
     NV_RM_RPC_CONTROL(pGpu, hClient, hChannel,
                       NVA06F_CTRL_CMD_RESTART_RUNLIST, &rr, sizeof(rr), st);
-    NV_PRINTF(LEVEL_ERROR,
+    //
+    // GSP answers NV_ERR_INVALID_STATE for channels being torn down: the
+    // scheduler learns a tenant has exited only at its next poll, so a
+    // command in the tenant's last moments lands on channels mid-teardown.
+    // Measured on B300: every such failure fell in a tenant's final second.
+    //
+    if (st == NV_OK)
+        g_ghostStats.restartsOk++;
+    else if (st == NV_ERR_INVALID_STATE)
+        g_ghostStats.restartsGone++;
+    else
+        g_ghostStats.restartsFailed++;
+    NV_PRINTF((st == NV_OK || st == NV_ERR_INVALID_STATE) ? LEVEL_INFO : LEVEL_ERROR,
               "GHOST sched: RESTART_RUNLIST chan 0x%08x -> 0x%x\n", hChannel, st);
 }
 
@@ -327,7 +356,11 @@ ghostSchedWorkItem(NvU32 gpuInstance, void *pParams)
             NV_RM_RPC_CONTROL(pGpu, g_ghostGroups[i].hClient,
                               g_ghostGroups[i].hGroup,
                               NVA06C_CTRL_CMD_SET_TIMESLICE, &ts, sizeof(ts), st);
-            NV_PRINTF(LEVEL_ERROR,
+            if (st == NV_OK)
+                g_ghostStats.cmdsOk++;
+            else
+                g_ghostStats.cmdsFailed++;
+            NV_PRINTF((st == NV_OK) ? LEVEL_INFO : LEVEL_ERROR,
                       "GHOST sched: pid %u SET_TIMESLICE grp 0x%08x = %u us -> 0x%x\n",
                       pWi->pid, g_ghostGroups[i].hGroup, pWi->arg, st);
             for (c = 0; c < g_ghostGroups[i].nCh; c++)
@@ -356,7 +389,11 @@ ghostSchedWorkItem(NvU32 gpuInstance, void *pParams)
             NV_RM_RPC_CONTROL(pGpu, pGpu->hInternalClient, pGpu->hInternalSubdevice,
                               NV2080_CTRL_CMD_FIFO_DISABLE_CHANNELS,
                               pDis, sizeof(*pDis), st);
-            NV_PRINTF(LEVEL_ERROR,
+            if (st == NV_OK)
+                g_ghostStats.cmdsOk++;
+            else
+                g_ghostStats.cmdsFailed++;
+            NV_PRINTF((st == NV_OK) ? LEVEL_INFO : LEVEL_ERROR,
                       "GHOST sched: pid %u %s %u channels -> 0x%x\n",
                       pWi->pid, (pWi->action == 0) ? "ATTACH" : "DETACH",
                       g_ghostGroups[i].nCh, st);
@@ -496,6 +533,15 @@ ghostSchedFormatActive_GHOST(char *buf, int cap)
                                gpuGetDomain(pGpu), gpuGetBus(pGpu), gpuGetDevice(pGpu),
                                g_ghostGroups[i].pid, act ? 1 : 0, nTsg);
     }
+
+    // Totals since load. Readers that know only the pid/dev lines skip it.
+    if (n < cap)
+        n += nvDbgSnprintf(buf + n, cap - n,
+                           "stats cmds_ok %llu cmds_failed %llu restarts_ok %llu "
+                           "restarts_teardown %llu restarts_failed %llu table_full %llu\n",
+                           g_ghostStats.cmdsOk, g_ghostStats.cmdsFailed,
+                           g_ghostStats.restartsOk, g_ghostStats.restartsGone,
+                           g_ghostStats.restartsFailed, g_ghostStats.tableFull);
     return n;
 }
 
