@@ -138,3 +138,33 @@ are quiesced. The A100/A6000/5070 procedures are in
 - **`vcluster-multitenant`** sits above gVisor and never touches the driver
   directly; it decides which tenants exist, which then map to sandboxes whose
   pids appear in the control surface above.
+
+---
+
+## Known issues (found on 8x B300, 2026-09-29)
+
+Measured on a multi-GPU node; see
+`vcluster-multitenant/manifests/b300/README.md` for the full runbook and numbers.
+
+- **The group table never frees entries, and then fails open.**
+  `g_ghostGroups[GHOST_MAX_GROUPS]` (256) in `kernel_channel_group_api.c` gains
+  one slot per recorded channel group and never releases it when the client
+  goes away. A 4-GPU NCCL pod takes about 56 slots and an 8-GPU pod about 110,
+  so the table filled after 10 sandboxes. After that, no new tenant is tracked
+  and `runsc gpu-scheduler --runlist-control` binds nothing. A 75/25 cuBLAS pair
+  went from 2.94:1 to 645:644, and nothing was logged. The stale entries are
+  also what produce the `RESTART_RUNLIST`/`SET_TIMESLICE -> 0x23`
+  (INVALID_CLIENT) and `-> 0x57` (OBJECT_NOT_FOUND) lines in dmesg. Only a
+  module reload clears the table. Fix: drop a group's slot when its channel
+  group is destroyed (or reuse slots whose `hClient` no longer resolves), and
+  log when the table is full.
+- **The broker is single-GPU and keyed by pid.** `g_ghostGpu` is whichever GPU
+  most recently recorded a group, and `detach/attach/ts <pid>` act on all of
+  that pid's channels on every GPU. The scheduler divides each GPU separately,
+  so a sandbox holding several GPUs, one of them shared, would be detached on
+  all of them during another tenant's window on the shared one. This comes from
+  reading the code and has not been measured. The control surface needs a GPU
+  (or channel-group) qualifier.
+- `GHOST_TOTAL_TPC` is per GPU: B300 SXM6 = 74 (148 SMs). The deferred re-probe
+  defaults to 27 TPCs per context unless `GhostTpcCount=0` is passed, which
+  silently caps a B300 at about a third.
