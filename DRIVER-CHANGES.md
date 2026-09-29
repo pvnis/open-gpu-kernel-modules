@@ -55,10 +55,12 @@ GSP to re-read it. See `gvisor/NVIDIA-COMPUTE-ISOLATION.md` (CORRECTION 3) for
 the full derivation.
 
 `kernel_ctxshare.c` additionally carries the **spatial** TPC-partition probe
-(`SET_TPC_PARTITION_TABLE` issued from the deferred `GPFIFO_SCHEDULE` site) and
-the `GHOST_TOTAL_TPC` constant — half the GPU's SM count, a **per-GPU knob**
-(A100 = 54, A6000 = 42, RTX 5070 = 24). That knob only affects the spatial
-probes, not the credit scheduler.
+(`SET_TPC_PARTITION_TABLE` issued from the deferred `GPFIFO_SCHEDULE` site),
+off unless loaded with `GhostProbe=1`. Its size is each GPU's enabled-TPC
+count, read at runtime from the floorsweeping masks RM caches at load, so the
+same build works on every GPU. (It used to be the compile-time constant
+`GHOST_TOTAL_TPC`, edited per model: A100 = 54, A6000 = 42, RTX 5070 = 24,
+B300 = 74.) It affects only the spatial probes, not the credit scheduler.
 
 ---
 
@@ -206,6 +208,16 @@ Measured on a multi-GPU node; see
   under `src/nvidia/` (RM core is a prebuilt object, not hashed into it). Use
   the build timestamp in the `NVRM: loading ... Release Build (... <date>)`
   line instead.
-- `GHOST_TOTAL_TPC` is per GPU: B300 SXM6 = 74 (148 SMs). The deferred re-probe
-  defaults to 27 TPCs per context unless `GhostTpcCount=0` is passed, which
-  silently caps a B300 at about a third.
+- **FIXED: the TPC count was a per-model compile-time constant.**
+  `GHOST_TOTAL_TPC` had to be edited for every GPU (and the construct-time probe
+  hard-coded 27, half an A100). It is now read at runtime as the sum of the
+  per-GPC enabled-TPC counts in the floorsweeping masks. Not
+  `NV0080_CTRL_GR_INFO_INDEX_SHADER_PIPE_COUNT`: that reports 8 on a B300
+  against its real 74. The disjoint-slice cursor (`g_ghostNextBase`,
+  `g_ghostSliceIdx`) is now per GPU rather than one global shared across all of
+  them. Each deferred entry records its own GPU, and a completed entry's slot
+  is reused (the 128-entry table used to fill after a few CUDA processes, and
+  later contexts went unprobed). Verified on B300 with
+  `GhostProbe=1;GhostTpcCount=37;GhostDisjoint=1`: "granted 37 TPCs 0..36 of
+  74", then 37..73, then wrapping to 0..36, per GPU; with the probes off, a full
+  GPU runs at 1357 TFLOPS with no GHOST lines.

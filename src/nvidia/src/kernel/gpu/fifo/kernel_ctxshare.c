@@ -56,9 +56,9 @@
 // GPFIFO_SCHEDULE path, by which point the object is registered with GSP. The
 // pair of results discriminates "called too early" from "die lacks the feature".
 #define GHOST_MAX_DEFERRED 128
-#define GHOST_TOTAL_TPC     24   // RTX 5070: 48 SMs / 2 SMs per TPC
 typedef struct
 {
+    OBJGPU  *pGpu;       // the GPU the ctxshare is on; its TPCs are the ones to divide
     NvHandle hClient;
     NvHandle hDevice;
     NvHandle hChanGrp;
@@ -67,12 +67,49 @@ typedef struct
 } GHOST_DEFERRED;
 GHOST_DEFERRED g_ghostDeferred[GHOST_MAX_DEFERRED];
 NvU32          g_ghostDeferredCount = 0;
-// How many partitions have been successfully imposed so far. With
+// How many partitions have been successfully imposed so far, per GPU. With
 // GhostDisjoint=1 this picks a non-overlapping TPC range per tenant, which is
 // the actual AMD-CU-mask analog: tenant N gets TPCs [N*count, (N+1)*count).
-NvU32          g_ghostSliceIdx = 0;
-// Next free TPC index, so tenants of *unequal* width still get disjoint ranges.
-NvU32          g_ghostNextBase = 0;
+// Per GPU because each GPU's TPCs are a separate budget: one shared counter
+// handed tenants on different GPUs shifted ranges of one another's.
+NvU32          g_ghostSliceIdx[NV_MAX_DEVICES];
+// Next free TPC index on each GPU, so tenants of *unequal* width still get
+// disjoint ranges.
+NvU32          g_ghostNextBase[NV_MAX_DEVICES];
+
+//
+// ghostTotalTpc_GHOST returns the number of enabled TPCs on pGpu -- the valid
+// global TPC indices for SET_TPC_PARTITION_TABLE are 0..N-1 -- as the sum of
+// the per-GPC enabled-TPC counts in the floorsweeping masks RM caches at load,
+// so a floorswept die reports what it really has. 0 if it is not known, in
+// which case no partition is imposed. This used to be a compile-time constant
+// that had to be edited for every GPU model.
+//
+// Not NV0080_CTRL_GR_INFO_INDEX_SHADER_PIPE_COUNT: its "number of enabled
+// TPCs" is the Tesla-era meaning, and a B300 reports 8 there against 74 TPCs.
+//
+static NvU32
+ghostTotalTpc_GHOST(OBJGPU *pGpu)
+{
+    KernelGraphicsManager *pKernelGraphicsManager;
+    const GRMGR_LEGACY_KGRAPHICS_STATIC_INFO *pInfo;
+    NvU32 total = 0;
+    NvU32 gpc;
+
+    if (pGpu == NULL)
+        return 0;
+    pKernelGraphicsManager = GPU_GET_KERNEL_GRAPHICS_MANAGER(pGpu);
+    if (pKernelGraphicsManager == NULL)
+        return 0;
+    pInfo = kgrmgrGetLegacyKGraphicsStaticInfo(pGpu, pKernelGraphicsManager);
+    if ((pInfo == NULL) || !pInfo->bInitialized)
+        return 0;
+    for (gpc = 0; gpc < NV2080_CTRL_INTERNAL_GR_MAX_GPC; gpc++)
+        total += pInfo->floorsweepingMasks.tpcCount[gpc];
+    if (total > NV9067_CTRL_TPC_PARTITION_TABLE_TPC_COUNT_MAX)
+        total = NV9067_CTRL_TPC_PARTITION_TABLE_TPC_COUNT_MAX;
+    return total;
+}
 
 //
 // Tenant identity for the experiments: the calling process. A tenant creates
@@ -267,11 +304,13 @@ kctxshareapiConstruct_IMPL
     //
     // MEASURED on consumer Blackwell (RTX 5070, GB205): both 0x57. UNKNOWN and
     // worth testing on datacenter/pro dies (RTX A6000 GA102, RTX 6000 Pro
-    // Blackwell GB202, A100/H100). GHOST_TPC_COUNT is hardcoded for the test; a
-    // real version keys it on a per-sandbox weight and picks disjoint ranges.
+    // Blackwell GB202, A100/H100). The probe asks for half of the GPU's TPCs,
+    // read at runtime; a real version keys it on a per-sandbox weight and
+    // picks disjoint ranges.
     if ((rmStatus == NV_OK) && ghostProbesEnabled_GHOST(GPU_RES_GET_GPU(pKernelCtxShareApi)))
     {
-        enum { GHOST_TPC_COUNT = 27 };  // half of the A100's 54 TPCs (108 SMs); adjust per GPU
+        // Half of this GPU's TPCs: the half-partition the probe asks for.
+        const NvU32 ghostTpcHalf = ghostTotalTpc_GHOST(GPU_RES_GET_GPU(pKernelCtxShareApi)) / 2;
         RM_API   *pRmApi    = rmapiGetInterface(RMAPI_GPU_LOCK_INTERNAL);
         NvHandle  hCtxShare = RES_GET_HANDLE(pKernelCtxShareApi);
         NV0080_CTRL_GR_TPC_PARTITION_MODE_PARAMS modeParams;
@@ -332,8 +371,8 @@ kctxshareapiConstruct_IMPL
 
             // --- 0c5: the half-partition we actually want to impose.
             portMemSet(pTbl, 0, sizeof(*pTbl));
-            pTbl->numUsedTpc = GHOST_TPC_COUNT;
-            for (i = 0; i < GHOST_TPC_COUNT; i++)
+            pTbl->numUsedTpc = (NvU16)ghostTpcHalf;
+            for (i = 0; i < ghostTpcHalf; i++)
             {
                 pTbl->tpcList[i].globalTpcIndex = i;
                 pTbl->tpcList[i].lmemBlockIndex = i;
@@ -356,18 +395,35 @@ kctxshareapiConstruct_IMPL
                   "GHOST 0c: ctxshare 0x%08x SETMODE(STATIC)=0x%x GETMODE=0x%x(mode=%u allTpc=%u) "
                   "GETTBL0=0x%x(n=%u) SETTBL(1)=0x%x SETTBL(%u)=0x%x GETTBL1=0x%x(n=%u)\n",
                   hCtxShare, sMode, sModeGet, modeGot, allTpcGot,
-                  sTblGet0, nUsed0, sTbl1, (NvU32)GHOST_TPC_COUNT, sTblN,
+                  sTblGet0, nUsed0, sTbl1, ghostTpcHalf, sTblN,
                   sTblGet1, nUsed1);
 
         // Record for the deferred (0e) re-probe once GSP knows this object.
-        if (g_ghostDeferredCount < GHOST_MAX_DEFERRED)
+        // A slot whose re-probe has already run is reused; without that the
+        // table filled after a few CUDA processes (each records several
+        // ctxshares) and every later context silently went unprobed.
         {
-            GHOST_DEFERRED *pD = &g_ghostDeferred[g_ghostDeferredCount++];
-            pD->hClient   = hClient;
-            pD->hDevice   = hDevice;
-            pD->hChanGrp  = pParams->hParent;
-            pD->hCtxShare = hCtxShare;
-            pD->bDone     = NV_FALSE;
+            GHOST_DEFERRED *pD = NULL;
+            NvU32 slot;
+            for (slot = 0; slot < g_ghostDeferredCount; slot++)
+            {
+                if (g_ghostDeferred[slot].bDone)
+                {
+                    pD = &g_ghostDeferred[slot];
+                    break;
+                }
+            }
+            if ((pD == NULL) && (g_ghostDeferredCount < GHOST_MAX_DEFERRED))
+                pD = &g_ghostDeferred[g_ghostDeferredCount++];
+            if (pD != NULL)
+            {
+                pD->pGpu      = GPU_RES_GET_GPU(pKernelCtxShareApi);
+                pD->hClient   = hClient;
+                pD->hDevice   = hDevice;
+                pD->hChanGrp  = pParams->hParent;
+                pD->hCtxShare = hCtxShare;
+                pD->bDone     = NV_FALSE;
+            }
         }
 
         // 0d: per-subcontext CUDA Work Distributor watermark (min = most throttled).
@@ -473,20 +529,29 @@ ghostReprobeDeferred_GHOST(OBJGPU *pGpu)
             allTpcGot = (NvU32)modeParams.bEnableAllTpcs;
         }
 
-        if (ghostTpcCount > 0)
+        // The ctxshare's own GPU, whose TPCs are divided; the GPU this pass
+        // was triggered from may be another.
+        OBJGPU *pDGpu    = (pD->pGpu != NULL) ? pD->pGpu : pGpu;
+        NvU32   gpuIdx   = pDGpu->gpuInstance;
+        NvU32   totalTpc = ghostTotalTpc_GHOST(pDGpu);
+
+        if ((ghostTpcCount > 0) && (totalTpc > 0) && (gpuIdx < NV_MAX_DEVICES))
         {
             pTbl = portMemAllocNonPaged(sizeof(*pTbl));
             if (pTbl != NULL)
             {
                 NvU32 base = 0;
-                NvU32 count = ((g_ghostSliceIdx > 0) && (ghostTpcCountB > 0))
+                NvU32 count = ((g_ghostSliceIdx[gpuIdx] > 0) && (ghostTpcCountB > 0))
                               ? ghostTpcCountB : ghostTpcCount;
 
+                // A partition cannot be wider than the GPU.
+                if (count > totalTpc)
+                    count = totalTpc;
                 if (ghostDisjoint != 0)
                 {
-                    if (g_ghostNextBase + count > GHOST_TOTAL_TPC)
-                        g_ghostNextBase = 0;
-                    base = g_ghostNextBase;
+                    if (g_ghostNextBase[gpuIdx] + count > totalTpc)
+                        g_ghostNextBase[gpuIdx] = 0;
+                    base = g_ghostNextBase[gpuIdx];
                 }
 
                 portMemSet(pTbl, 0, sizeof(*pTbl));
@@ -504,12 +569,12 @@ ghostReprobeDeferred_GHOST(OBJGPU *pGpu)
                 if (sTblN == NV_OK)
                 {
                     NV_PRINTF(LEVEL_ERROR,
-                              "GHOST 0f: ctxshare 0x%08x granted %u TPCs %u..%u (slice %u)\n",
+                              "GHOST 0f: ctxshare 0x%08x granted %u TPCs %u..%u of %u (GPU %u slice %u)\n",
                               pD->hCtxShare, count, base, base + count - 1,
-                              g_ghostSliceIdx);
-                    g_ghostSliceIdx++;
+                              totalTpc, gpuIdx, g_ghostSliceIdx[gpuIdx]);
+                    g_ghostSliceIdx[gpuIdx]++;
                     if (ghostDisjoint != 0)
-                        g_ghostNextBase = base + count;
+                        g_ghostNextBase[gpuIdx] = base + count;
                 }
             }
         }
