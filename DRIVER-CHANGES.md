@@ -146,25 +146,41 @@ are quiesced. The A100/A6000/5070 procedures are in
 Measured on a multi-GPU node; see
 `vcluster-multitenant/manifests/b300/README.md` for the full runbook and numbers.
 
-- **The group table never frees entries, and then fails open.**
-  `g_ghostGroups[GHOST_MAX_GROUPS]` (256) in `kernel_channel_group_api.c` gains
-  one slot per recorded channel group and never releases it when the client
-  goes away. A 4-GPU NCCL pod takes about 56 slots and an 8-GPU pod about 110,
-  so the table filled after 10 sandboxes. After that, no new tenant is tracked
-  and `runsc gpu-scheduler --runlist-control` binds nothing. A 75/25 cuBLAS pair
-  went from 2.94:1 to 645:644, and nothing was logged. The stale entries are
-  also what produce the `RESTART_RUNLIST`/`SET_TIMESLICE -> 0x23`
-  (INVALID_CLIENT) and `-> 0x57` (OBJECT_NOT_FOUND) lines in dmesg. Only a
-  module reload clears the table. Fix: drop a group's slot when its channel
-  group is destroyed (or reuse slots whose `hClient` no longer resolves), and
-  log when the table is full.
-- **The broker is single-GPU and keyed by pid.** `g_ghostGpu` is whichever GPU
-  most recently recorded a group, and `detach/attach/ts <pid>` act on all of
-  that pid's channels on every GPU. The scheduler divides each GPU separately,
-  so a sandbox holding several GPUs, one of them shared, would be detached on
-  all of them during another tenant's window on the shared one. This comes from
-  reading the code and has not been measured. The control surface needs a GPU
-  (or channel-group) qualifier.
+- **FIXED (b300-multigpu): the group table never freed entries (fail-open).**
+  `g_ghostGroups[GHOST_MAX_GROUPS]` (256) gained a slot per recorded channel
+  group and never released it. After about 10 multi-GPU sandboxes the table
+  was full, no new tenant was tracked, and a 75/25 cuBLAS pair went from
+  2.94:1 to 645:644. Now `kchangrpapiDestruct_IMPL` releases the slot through
+  `ghostSchedForget_GHOST(hClient, hGroup)`; every teardown path goes through
+  it, including a sandbox's client being freed at exit. Record reuses freed
+  slots, and a full table is logged (once per fill) rather than dropped
+  silently. Verified: three 8-GPU NCCL pods in a row (~330 groups) and the
+  table drains to 0 after each.
+- **FIXED (b300-multigpu): every broker RPC went to one GPU.** `g_ghostGpu` was
+  whichever GPU most recently recorded a group, and the work item sent every
+  group's `SET_TIMESLICE`, `DISABLE_CHANNELS` and `RESTART_RUNLIST` there, and
+  read USERD through that GPU's memory manager. Groups on any other GPU got
+  `NV_ERR_OBJECT_NOT_FOUND` (0x57): 147 of 168 `SET_TIMESLICE` calls failed for
+  an 8-GPU pod. A tenant creating a context on GPU B would silently take
+  enforcement away from a weighted pair on GPU A. Each group now records its
+  own `OBJGPU`, and the work item addresses that GPU; it already holds every
+  GPU's lock (`bLockGpus` => `GPU_LOCK_GRP_ALL`). Verified: `SET_TIMESLICE`
+  155/155 OK on an 8-GPU pod, and a 75/25 pair on one GPU held 3.06:1 while
+  another pod created 26 contexts on a different GPU.
+- **Still open: control is per pid, not per GPU.** `detach/attach/ts <pid>`
+  act on all of that pid's groups on every GPU, while `runsc gpu-scheduler`
+  divides each GPU separately. A multi-GPU sandbox that shares one of its GPUs
+  would be detached on all of them during another tenant's window on the
+  shared one. Fixing this needs a GPU qualifier on the procfs commands and in
+  `pkg/gpusched`'s enforcer.
+- Some `RESTART_RUNLIST` calls return `NV_ERR_INVALID_STATE` (0x40), about 27%
+  of them on an 8-GPU NCCL pod, presumably for channels not currently on a
+  runlist. Detach and timeslice succeed regardless; this was previously hidden
+  behind the 0x57s above.
+- `srcversion` is **not** a reliable "did my build load" check for changes
+  under `src/nvidia/` (RM core is a prebuilt object, not hashed into it). Use
+  the build timestamp in the `NVRM: loading ... Release Build (... <date>)`
+  line instead.
 - `GHOST_TOTAL_TPC` is per GPU: B300 SXM6 = 74 (148 SMs). The deferred re-probe
   defaults to 27 TPCs per context unless `GhostTpcCount=0` is passed, which
   silently caps a B300 at about a third.

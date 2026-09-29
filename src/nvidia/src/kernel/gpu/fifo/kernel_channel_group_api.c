@@ -73,6 +73,7 @@ extern NvU32 ghostTenantIndex_GHOST(void);
 typedef struct
 {
     NvU32     pid;        // owning process (the KVM Sentry, one per sandbox)
+    OBJGPU   *pGpu;       // the GPU this group runs on; its RPCs must go there
     NvHandle  hClient;
     NvHandle  hGroup;     // the channel-group (TSG) API handle, for SET_TIMESLICE
     NvHandle  hChannels[NV2080_CTRL_FIFO_DISABLE_CHANNELS_MAX_ENTRIES];
@@ -98,6 +99,7 @@ typedef struct
 static GHOST_GROUP g_ghostGroups[GHOST_MAX_GROUPS];
 static NvU32       g_ghostGroupCount = 0;
 static OBJGPU     *g_ghostGpu = NULL;
+static NvBool      g_ghostFullWarned = NV_FALSE;
 
 // ghostSchedRecord_GHOST: remember a channel group and its channels, keyed by
 // the calling process, so a later detach/attach can find them. Called from the
@@ -113,23 +115,50 @@ ghostSchedRecord_GHOST(OBJGPU *pGpu, NvU32 pid, NvHandle hClient,
         return;
     g_ghostGpu = pGpu;
 
-    // Reuse a slot for the same (pid, hClient) if we already have one.
+    // Reuse a slot for the same (pid, hClient, hGroup) if we already have one;
+    // otherwise take the first slot ghostSchedForget_GHOST released, and only
+    // then grow the table.
     slot = g_ghostGroupCount;
-    for (i = 0; i < g_ghostGroupCount; i++)
     {
-        if (g_ghostGroups[i].valid && g_ghostGroups[i].pid == pid &&
-            g_ghostGroups[i].hClient == hClient &&
-            g_ghostGroups[i].hGroup == hGroup)
+        NvU32 freeSlot = GHOST_MAX_GROUPS;
+        for (i = 0; i < g_ghostGroupCount; i++)
         {
-            slot = i;
-            break;
+            if (!g_ghostGroups[i].valid)
+            {
+                if (freeSlot == GHOST_MAX_GROUPS)
+                    freeSlot = i;
+                continue;
+            }
+            if (g_ghostGroups[i].pid == pid &&
+                g_ghostGroups[i].hClient == hClient &&
+                g_ghostGroups[i].hGroup == hGroup)
+            {
+                freeSlot = GHOST_MAX_GROUPS;
+                slot = i;
+                break;
+            }
         }
+        if (freeSlot != GHOST_MAX_GROUPS)
+            slot = freeSlot;
     }
     if (slot >= GHOST_MAX_GROUPS)
+    {
+        // An untracked group is one the scheduler can never detach, so the
+        // tenant runs unthrottled: this is a fail-open, and must be loud.
+        if (!g_ghostFullWarned)
+        {
+            NV_PRINTF(LEVEL_ERROR,
+                      "GHOST sched: group table full (%u); pid %u group 0x%08x "
+                      "is NOT tracked and will not be throttled\n",
+                      GHOST_MAX_GROUPS, pid, hGroup);
+            g_ghostFullWarned = NV_TRUE;
+        }
         return;
+    }
 
     portMemSet(&g_ghostGroups[slot], 0, sizeof(g_ghostGroups[slot]));
     g_ghostGroups[slot].pid     = pid;
+    g_ghostGroups[slot].pGpu    = pGpu;
     g_ghostGroups[slot].hClient = hClient;
     g_ghostGroups[slot].hGroup  = hGroup;
     for (pNode = pKcg->pChanList->pHead;
@@ -144,6 +173,33 @@ ghostSchedRecord_GHOST(OBJGPU *pGpu, NvU32 pid, NvHandle hClient,
     g_ghostGroups[slot].valid = NV_TRUE;
     if (slot == g_ghostGroupCount)
         g_ghostGroupCount++;
+}
+
+// ghostSchedForget_GHOST: release the slot recorded for (hClient, hGroup).
+// Called from the channel-group API destructor, which every teardown path goes
+// through -- an explicit free, and the client free when a process (a sandbox)
+// exits. Without it slots are never reclaimed: the table fills after a few
+// hundred channel groups (a multi-GPU NCCL job alone takes ~50), and from then
+// on every new tenant goes untracked and unthrottled. Runs under the same RM
+// locks as ghostSchedRecord_GHOST and the work item.
+static void
+ghostSchedForget_GHOST(NvHandle hClient, NvHandle hGroup)
+{
+    NvU32 i;
+
+    for (i = 0; i < g_ghostGroupCount; i++)
+    {
+        if (g_ghostGroups[i].valid &&
+            g_ghostGroups[i].hClient == hClient &&
+            g_ghostGroups[i].hGroup == hGroup)
+        {
+            g_ghostGroups[i].valid = NV_FALSE;
+            g_ghostGroups[i].nCh = 0;
+            g_ghostFullWarned = NV_FALSE;
+        }
+    }
+    while ((g_ghostGroupCount > 0) && !g_ghostGroups[g_ghostGroupCount - 1].valid)
+        g_ghostGroupCount--;
 }
 
 // Parameters carried to the work item.
@@ -173,17 +229,24 @@ static void
 ghostSchedWorkItem(NvU32 gpuInstance, void *pParams)
 {
     GHOST_SCHED_WI *pWi = (GHOST_SCHED_WI *)pParams;
-    OBJGPU *pGpu = g_ghostGpu;
     NvU32 i, c;
 
-    if (pGpu == NULL || pWi == NULL)
+    if (g_ghostGpu == NULL || pWi == NULL)
         goto done;
 
     for (i = 0; i < g_ghostGroupCount; i++)
     {
         NV_STATUS st = NV_OK;
+        //
+        // Every control below must reach the GPU that owns the group: a
+        // group's handles mean nothing to another GPU's GSP, which answers
+        // NV_ERR_OBJECT_NOT_FOUND. The work item holds every GPU's lock
+        // (bLockGpus => GPU_LOCK_GRP_ALL), so any of them may be addressed
+        // here, not just the one it was queued on.
+        //
+        OBJGPU *pGpu = g_ghostGroups[i].pGpu;
 
-        if (!g_ghostGroups[i].valid || g_ghostGroups[i].nCh == 0)
+        if (!g_ghostGroups[i].valid || g_ghostGroups[i].nCh == 0 || pGpu == NULL)
             continue;
         if (pWi->action != 3 && g_ghostGroups[i].pid != pWi->pid)
             continue;
@@ -937,6 +1000,10 @@ kchangrpapiDestruct_IMPL
     pClient = pCallContext->pClient;
 
     NV_PRINTF(LEVEL_INFO, "\n");
+
+    // GHOST: this handle is going away whether or not the shared group
+    // survives it, and the scheduler's slot names the group by this handle.
+    ghostSchedForget_GHOST(pClient->hClient, pResourceRef->hResource);
 
     // RS-TODO should still free channels?
     if (serverGetShareRefCount(&g_resServ, pShared) > 1)
